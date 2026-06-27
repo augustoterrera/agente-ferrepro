@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import logging
+import traceback
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
+
+from . import notifier
 
 from .chatwoot import (
     ChatwootError,
@@ -18,6 +22,18 @@ from .config import settings
 
 app = FastAPI(title="agente-ferrepro")
 logger = logging.getLogger(__name__)
+
+
+@app.exception_handler(Exception)
+async def _alerta_telegram(request: Request, exc: Exception) -> JSONResponse:
+    """Solo captura excepciones NO manejadas (500). Las HTTPException tienen su handler propio
+    de FastAPI, así que esto no se dispara con 4xx/5xx esperados. notifier nunca lanza."""
+    notifier.notify_error(
+        "excepción no manejada en la API",
+        detalle=traceback.format_exc(),
+        contexto={"method": request.method, "path": request.url.path},
+    )
+    return JSONResponse(status_code=500, content={"detail": "internal server error"})
 
 
 @app.on_event("startup")

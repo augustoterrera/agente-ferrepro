@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     chatwoot_outbox_max_retries: int = 5
     chatwoot_stale_processing_minutes: int = 15
 
+    # Alertas por Telegram (opcional). Sin token/chat → no-op. Avisa en fallos finales de tasks
+    # y excepciones no manejadas de la API.
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+    alert_project: str = "agente-ferrepro"
+
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
 
 

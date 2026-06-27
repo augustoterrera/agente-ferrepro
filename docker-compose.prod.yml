@@ -1,0 +1,27 @@
+# Override SOLO para el VPS: engancha el api al Traefik ya existente (red waichatt-finanzas_default,
+# entrypoint websecure, certresolver letsencrypt). Mismo molde que odranid.
+#
+# Deploy:  ENV_FILE=.env.prod docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# En dev NO se usa este archivo (no hay Traefik ni esa red en tu Mac).
+
+services:
+  api:
+    networks:
+      - default   # red interna: redis + workers
+      - proxy      # red externa de Traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=waichatt-finanzas_default"
+      # Solo /webhooks queda público (incluye /webhooks/chatwoot y /webhooks/chatwoot/health).
+      # El resto no se rutea. Webhook en Chatwoot: https://ferrepro.terreraaugusto.com/webhooks/chatwoot?token=<secret>
+      - "traefik.http.routers.ferrepro.rule=Host(`ferrepro.terreraaugusto.com`) && PathPrefix(`/webhooks`)"
+      - "traefik.http.routers.ferrepro.entrypoints=websecure"
+      - "traefik.http.routers.ferrepro.tls.certresolver=letsencrypt"
+      - "traefik.http.services.ferrepro.loadbalancer.server.port=8000"
+
+networks:
+  # Red donde corre el Traefik del VPS (creada por el compose de waichatt-finanzas).
+  proxy:
+    external: true
+    name: waichatt-finanzas_default

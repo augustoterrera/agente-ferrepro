@@ -8,11 +8,11 @@ services:
   api:
     build: .
     restart: unless-stopped
-    env_file: .env
+    env_file: ${ENV_FILE:-.env}
     environment:
       - REDIS_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
-    # Sin puerto publicado al host: el ingress es Caddy (prod) o ngrok (dev), que llegan a
+    # Sin puerto publicado al host: el ingress es Traefik (prod) o ngrok (dev), que llegan a
     # api:8000 por la red interna de Docker. Para debug local: docker compose exec api ...
     volumes:
       - ./app:/app/app          # edición en vivo: cambiás ferrepro.md / código y aplica sin rebuild
@@ -28,7 +28,7 @@ services:
   worker_messages:
     build: .
     restart: unless-stopped
-    env_file: .env
+    env_file: ${ENV_FILE:-.env}
     environment:
       - REDIS_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
@@ -41,7 +41,7 @@ services:
   worker_outbound:
     build: .
     restart: unless-stopped
-    env_file: .env
+    env_file: ${ENV_FILE:-.env}
     environment:
       - REDIS_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
@@ -54,7 +54,7 @@ services:
   beat:
     build: .
     restart: unless-stopped
-    env_file: .env
+    env_file: ${ENV_FILE:-.env}
     environment:
       - REDIS_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
@@ -77,25 +77,9 @@ services:
     depends_on:
       - api
 
-  # Reverse proxy con HTTPS automático (prod). Levantar con: docker compose --profile prod up -d
-  # Requiere DOMAIN en .env y que el dominio apunte a la IP del VPS (puertos 80/443 abiertos).
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    profiles: ["prod"]
-    ports:
-      - "80:80"
-      - "443:443"
-    environment:
-      - DOMAIN=${DOMAIN}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      - api
+# Prod: el HTTPS/reverse-proxy lo da el Traefik ya existente del VPS. Ver docker-compose.prod.yml
+# (enchufa el api al Traefik por labels + red externa). No incluimos proxy propio para no
+# competir por 80/443.
 
 volumes:
   redis_data:
-  caddy_data:
-  caddy_config:
