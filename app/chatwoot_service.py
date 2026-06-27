@@ -5,7 +5,7 @@ import json
 import logging
 from typing import Any
 
-from . import chat_memory, media
+from . import chat_memory, media, supabase
 from .agent import run_agent
 from .chatwoot import ChatwootMessageEvent, chatwoot_contact_id, message_attachments
 from .config import settings
@@ -25,6 +25,47 @@ def outbox_idempotency_key(conversation_id: int | str, message_ids: list[int], c
         json.dumps({"c": str(conversation_id), "m": message_ids, "t": content}, sort_keys=True).encode("utf-8")
     ).hexdigest()
     return f"chatwoot:{conversation_id}:{digest}"
+
+
+def sync_crm_contact(conversation_external_id: int | str | None, payload: dict[str, Any]) -> None:
+    """Registra/actualiza el contacto en el CRM (crm_contacts) — basta con el primer mensaje.
+    Upsert idempotente por teléfono; no toca los flags llamada/venta. Fire-and-forget: corre en
+    el worker (no en el webhook) y un Supabase caído no debe afectar la respuesta al cliente."""
+    sender = payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
+    contact = payload.get("contact") if isinstance(payload.get("contact"), dict) else {}
+    phone = str(sender.get("phone_number") or contact.get("phone_number") or "").strip()
+    if not phone:
+        return
+
+    name = str(sender.get("name") or contact.get("name") or "").strip() or None
+    try:
+        conversation_id = int(conversation_external_id)
+    except (TypeError, ValueError):
+        conversation_id = None
+
+    try:
+        supabase.rpc(
+            "crm_set_contact_status",
+            {
+                "p_phone": phone,
+                "p_name": name,
+                "p_llamada": None,
+                "p_venta": None,
+                "p_conversation_id": conversation_id,
+                "p_conversation_display_id": None,
+            },
+        )
+    except supabase.SupabaseError as exc:
+        logger.warning("crm_contact_sync_failed", extra={"conversation_id": conversation_id, "error": str(exc)})
+
+
+def sync_crm_label(conversation_external_id: int | str, label: str) -> None:
+    """Persiste la etiqueta del clasificador en crm_contacts para que la lea el dashboard.
+    Keyed por conversation_id (el contacto ya fue registrado por sync_crm_contact). Fire-and-forget."""
+    try:
+        supabase.update("crm_contacts", f"conversation_id=eq.{conversation_external_id}", {"conversation_labels": label})
+    except supabase.SupabaseError as exc:
+        logger.warning("crm_label_sync_failed", extra={"conversation_id": conversation_external_id, "error": str(exc)})
 
 
 def persist_incoming_chatwoot_event(
@@ -64,6 +105,10 @@ def process_pending_conversation_messages(conversation_id: int) -> int | None:
         chat_memory.update_jobs(conv.channel, conv.external_conversation_id, "completed")
         chat_memory.update_events(conv.channel, conv.external_conversation_id, "completed")
         return None
+
+    # Registrar el contacto en el CRM (idempotente, fire-and-forget). Acá y no en el webhook:
+    # mantiene Supabase fuera del camino crítico de intake.
+    sync_crm_contact(conv.external_conversation_id, pending[-1].get("raw_payload") or {})
 
     message_ids = [m["id"] for m in pending]
     user_content, images, audio_transcripts = _collect_inputs(pending)

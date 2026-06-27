@@ -53,12 +53,27 @@ celery_app.conf.update(
 )
 
 
+# Sweepers idempotentes del beat: si fallan tras los retries (ej. Supabase intermitente más
+# que la ventana de reintento), el próximo tick se recupera solo —los jobs/outbox viven en
+# Supabase, no se pierde nada—. No alertamos para no spamear con blips transitorios; las tasks
+# user-facing (process/send) sí alertan porque ahí sí queda un cliente sin respuesta.
+_ALERTAS_SILENCIADAS = {
+    "app.tasks.chatwoot_tasks.retry_stale_processing_jobs",
+    "app.tasks.chatwoot_tasks.dispatch_pending_outbox_messages",
+    "app.tasks.chatwoot_tasks.requeue_stuck_conversation_jobs",
+    "app.tasks.chatwoot_tasks.cleanup_expired_locks",
+}
+
+
 @task_failure.connect
 def _alerta_telegram(sender=None, task_id=None, exception=None, args=None, kwargs=None, einfo=None, **extra):
     """Avisa por Telegram cuando una task agota reintentos y falla definitivamente. task_failure
     se dispara solo en el fallo FINAL (no por cada retry), así que no genera spam."""
+    name = getattr(sender, "name", "?")
+    if name in _ALERTAS_SILENCIADAS:
+        return  # sweeper idempotente: se recupera solo en el próximo tick
     notifier.notify_error(
-        f"task {getattr(sender, 'name', '?')} falló",
+        f"task {name} falló",
         detalle=(einfo.traceback if einfo else str(exception)),
         contexto={"task_id": task_id, "args": args},
     )

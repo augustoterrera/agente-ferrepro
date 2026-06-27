@@ -11,7 +11,7 @@ import redis
 from app import chat_memory
 from app.celery_app import celery_app
 from app.chatwoot import ChatwootError, build_chatwoot_client
-from app.chatwoot_service import process_pending_conversation_messages
+from app.chatwoot_service import process_pending_conversation_messages, sync_crm_label
 from app.classifier import CLASSIFIER_LABELS, classify
 from app.config import settings
 from app.search import SearchError
@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 # Excepciones transitorias que justifican reintentar la task (red/DB/LLM caídos un momento).
 RETRYABLE = (SupabaseError, SearchError, ChatwootError)
+
+# Reintento para los sweepers del beat: un 502/blip transitorio de Supabase se cura solo en
+# pocos segundos (1+2+4s). Solo alerta si sigue fallando tras los retries (outage real).
+SWEEPER_RETRY = dict(autoretry_for=RETRYABLE, retry_backoff=True, retry_jitter=True, max_retries=3)
 
 
 def _redis() -> redis.Redis:
@@ -194,6 +198,7 @@ def classify_and_label_conversation(conversation_id: str) -> dict[str, object]:
         return {"ok": False, "status": "chatwoot_not_configured"}
 
     label = classify(chat_memory.recent_history(int(conversation_id), settings.chatwoot_history_limit))
+    sync_crm_label(conv.external_conversation_id, label)  # para el dashboard (fire-and-forget)
     try:
         current = client.get_conversation_labels(account_id, conv.external_conversation_id)
         preserved = [lbl for lbl in current if lbl not in CLASSIFIER_LABELS]
@@ -205,7 +210,7 @@ def classify_and_label_conversation(conversation_id: str) -> dict[str, object]:
 
 
 # ── Sweepers del beat (red de seguridad de la cola) ─────────────────────────
-@celery_app.task(name="app.tasks.chatwoot_tasks.retry_stale_processing_jobs", queue="chatwoot_messages")
+@celery_app.task(name="app.tasks.chatwoot_tasks.retry_stale_processing_jobs", queue="chatwoot_messages", **SWEEPER_RETRY)
 def retry_stale_processing_jobs() -> dict[str, object]:
     ids = chat_memory.requeue_stale_jobs(settings.chatwoot_stale_processing_minutes)
     for cid in ids:
@@ -213,7 +218,7 @@ def retry_stale_processing_jobs() -> dict[str, object]:
     return {"ok": True, "requeued": len(ids)}
 
 
-@celery_app.task(name="app.tasks.chatwoot_tasks.dispatch_pending_outbox_messages", queue="chatwoot_outbound")
+@celery_app.task(name="app.tasks.chatwoot_tasks.dispatch_pending_outbox_messages", queue="chatwoot_outbound", **SWEEPER_RETRY)
 def dispatch_pending_outbox_messages() -> dict[str, object]:
     rows = chat_memory.pending_outbox(settings.channel)
     for row in rows:
@@ -221,7 +226,7 @@ def dispatch_pending_outbox_messages() -> dict[str, object]:
     return {"ok": True, "dispatched": len(rows)}
 
 
-@celery_app.task(name="app.tasks.chatwoot_tasks.requeue_stuck_conversation_jobs", queue="chatwoot_messages")
+@celery_app.task(name="app.tasks.chatwoot_tasks.requeue_stuck_conversation_jobs", queue="chatwoot_messages", **SWEEPER_RETRY)
 def requeue_stuck_conversation_jobs() -> dict[str, object]:
     ids = [*chat_memory.due_job_conversation_ids(), *chat_memory.requeue_stale_jobs(settings.chatwoot_stale_processing_minutes)]
     for cid in set(ids):
@@ -230,6 +235,6 @@ def requeue_stuck_conversation_jobs() -> dict[str, object]:
     return {"ok": True, "requeued": len(set(ids))}
 
 
-@celery_app.task(name="app.tasks.chatwoot_tasks.cleanup_expired_locks", queue="chatwoot_messages")
+@celery_app.task(name="app.tasks.chatwoot_tasks.cleanup_expired_locks", queue="chatwoot_messages", **SWEEPER_RETRY)
 def cleanup_expired_locks() -> dict[str, object]:
     return {"ok": True, "cleaned": chat_memory.cleanup_expired_locks()}
