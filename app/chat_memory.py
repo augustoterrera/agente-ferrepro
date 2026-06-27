@@ -166,6 +166,11 @@ def pending_messages(conversation_id: int, limit: int = 50) -> list[dict]:
     )
 
 
+def set_message_content(message_id: int, content: str) -> None:
+    """Reemplaza el contenido de un mensaje (ej. guardar la transcripción de un audio)."""
+    supabase.update("chat_messages", f"id=eq.{message_id}", {"content": content})
+
+
 def mark_messages_processed(message_ids: list[int]) -> None:
     if not message_ids:
         return

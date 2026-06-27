@@ -126,11 +126,12 @@ def extract_message_event(payload: dict[str, Any], history_limit: int = 16) -> t
         return None, "ignored_non_incoming_message"
     if bool(payload.get("private")):
         return None, "ignored_private_message"
-    if str(payload.get("content_type") or "text") != "text":
+    attachments = message_attachments(payload)
+    if str(payload.get("content_type") or "text") != "text" and not attachments:
         return None, "ignored_non_text_message"
 
     content = str(payload.get("content") or "").strip()
-    if not content:
+    if not content and not attachments:
         return None, "ignored_empty_message"
 
     conversation = payload.get("conversation") if isinstance(payload.get("conversation"), dict) else {}
@@ -184,6 +185,22 @@ def _role(message: dict[str, Any]) -> str | None:
     if message_type in ("outgoing", 1):
         return "assistant"
     return None
+
+
+def message_attachments(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Adjuntos del mensaje (imágenes/audios/archivos) tal como los manda Chatwoot."""
+    raw = payload.get("attachments")
+    out: list[dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return out
+    for att in raw:
+        if not isinstance(att, dict):
+            continue
+        url = att.get("data_url") or att.get("thumb_url")
+        file_type = att.get("file_type")
+        if url and file_type:
+            out.append({"type": str(file_type), "url": str(url), "extension": att.get("extension")})
+    return out
 
 
 def conversation_labels(payload: dict[str, Any]) -> list[str]:

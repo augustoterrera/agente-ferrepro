@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, BinaryContent, RunContext
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -96,11 +96,20 @@ def _detalle(product_id: int, deps: Deps) -> dict[str, Any]:
     }
 
 
-def run_agent(message: str, history: list[AgentMessage] | None = None) -> str:
+def run_agent(
+    message: str,
+    history: list[AgentMessage] | None = None,
+    images: list[tuple[bytes, str]] | None = None,
+) -> str:
+    """`images`: lista de (bytes, media_type) para que el modelo multimodal las vea."""
     agent = build_agent()
     deps = Deps()
+    text = _build_input(message, history or [])
+    prompt: object = text
+    if images:
+        prompt = [text, *[BinaryContent(data=data, media_type=mt) for data, mt in images]]
     try:
-        result = agent.run_sync(_build_input(message, history or []), deps=deps)
+        result = agent.run_sync(prompt, deps=deps)
     except Exception as exc:
         raise AgentError(f"Falló la corrida del agente: {exc}") from exc
     return guard_links(result.output, deps.shown_links | FIXED_LINKS)

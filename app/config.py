@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     agent_reasoning_effort: str | None = "low"
     # Clasificador de etiquetas: tarea simple (4 categorías) → modelo barato y rápido, sin razonar.
     classifier_model: str = "gpt-4.1-mini"
+    # Transcripción de audios (WhatsApp → texto). Modelo barato de speech-to-text.
+    transcription_model: str = "gpt-4o-mini-transcribe"
     # Etiqueta que, puesta por un humano en Chatwoot, silencia al bot (toma el control la persona).
     apagar_bot_label: str = "apagar_bot"
 
