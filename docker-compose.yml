@@ -12,12 +12,18 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
-    ports:
-      - "8000:8000"
+    # Sin puerto publicado al host: el ingress es Caddy (prod) o ngrok (dev), que llegan a
+    # api:8000 por la red interna de Docker. Para debug local: docker compose exec api ...
     volumes:
       - ./app:/app/app          # edición en vivo: cambiás ferrepro.md / código y aplica sin rebuild
     depends_on:
       - redis
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   worker_messages:
     build: .
@@ -71,5 +77,25 @@ services:
     depends_on:
       - api
 
+  # Reverse proxy con HTTPS automático (prod). Levantar con: docker compose --profile prod up -d
+  # Requiere DOMAIN en .env y que el dominio apunte a la IP del VPS (puertos 80/443 abiertos).
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    profiles: ["prod"]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
 volumes:
   redis_data:
+  caddy_data:
+  caddy_config:

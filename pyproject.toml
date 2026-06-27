@@ -3,14 +3,17 @@ name = "agente-ferrepro"
 version = "0.1.0"
 description = "Agente de WhatsApp (Chatwoot) para Ferrepro: lee productos de Supabase y responde consultas."
 requires-python = ">=3.11"
+# Majors capeadas: permiten parches/minors pero evitan que un build futuro traiga una major
+# nueva y rompa. Versiones probadas: pydantic-ai 2.0, openai 2.44.
 dependencies = [
-    "pydantic>=2.7",
-    "pydantic-settings>=2.3",
-    "pydantic-ai>=0.0.49",
-    "fastapi>=0.111",
-    "uvicorn[standard]>=0.30",
-    "celery[redis]>=5.4",
-    "redis>=5.0",
+    "pydantic>=2.7,<3",
+    "pydantic-settings>=2.3,<3",
+    "pydantic-ai>=2,<3",
+    "openai>=1.60,<3",
+    "fastapi>=0.111,<1",
+    "uvicorn[standard]>=0.30,<1",
+    "celery[redis]>=5.4,<6",
+    "redis>=5,<7",
 ]
 
 [build-system]

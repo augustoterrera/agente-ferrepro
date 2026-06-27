@@ -1,0 +1,5 @@
+# Caddy saca y renueva el certificado HTTPS solo (Let's Encrypt) para el dominio de DOMAIN.
+# Requisito: el (sub)dominio debe apuntar (A/AAAA) a la IP del VPS, y los puertos 80/443 abiertos.
+{$DOMAIN} {
+	reverse_proxy api:8000
+}
