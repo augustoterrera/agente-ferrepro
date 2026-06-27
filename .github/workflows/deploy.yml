@@ -27,7 +27,13 @@ jobs:
           ruff check --select E9,F63,F7,F82 app
 
       - name: Build de la imagen Docker (valida Dockerfile + que las deps instalen)
-        run: docker build -t agente-ferrepro:ci .
+        run: |
+          n=0
+          until docker build -t agente-ferrepro:ci .; do
+            n=$((n+1))
+            [ "$n" -ge 3 ] && { echo "build falló tras $n intentos"; exit 1; }
+            echo "Docker Hub no respondió (blip de red); reintento $n en 15s..."; sleep 15
+          done
 
       - name: Smoke — que todos los módulos importen
         run: docker run --rm agente-ferrepro:ci python -c "import app.main, app.celery_app, app.tasks.chatwoot_tasks; print('import OK')"
