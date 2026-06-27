@@ -45,6 +45,10 @@ CLAUDE.md
 celerybeat-schedule
 celerybeat.pid
 
+# Docs locales (no van al repo)
+DESPLIEGUE.md
+FLUJO.md
+
 # Local drafts
 promptden8n
 promptden8n.md
