@@ -6,18 +6,24 @@ on:
   pull_request:
   workflow_dispatch: {}
 
-# Evita que dos deploys se pisen; si llega uno nuevo, espera al anterior (no lo corta).
 concurrency:
-  group: deploy-vps
+  group: deploy-vps-agente
   cancel-in-progress: false
 
+env:
+  IMAGE: ghcr.io/augustoterrera/agente-ferrepro
+
 jobs:
-  # ── Gate de calidad ── corre en cada push y PR. El deploy depende de que esto pase.
+  # ── Gate de calidad + build del artefacto ── corre en cada push y PR.
+  # En push a main, además pushea la imagen a GHCR (la que va a correr en prod).
   checks:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
 
@@ -26,26 +32,39 @@ jobs:
           pip install ruff
           ruff check --select E9,F63,F7,F82 app
 
-      - name: Build de la imagen Docker (valida Dockerfile + que las deps instalen)
+      - name: Build de la imagen (con reintentos ante blips de Docker Hub)
         run: |
           n=0
-          until docker build -t agente-ferrepro:ci .; do
-            n=$((n+1))
-            [ "$n" -ge 3 ] && { echo "build falló tras $n intentos"; exit 1; }
-            echo "Docker Hub no respondió (blip de red); reintento $n en 15s..."; sleep 15
+          until docker build -t "$IMAGE:$GITHUB_SHA" -t "$IMAGE:latest" .; do
+            n=$((n+1)); [ "$n" -ge 3 ] && { echo "build falló tras $n intentos"; exit 1; }
+            echo "Docker Hub no respondió; reintento $n en 15s..."; sleep 15
           done
 
       - name: Smoke — que todos los módulos importen
-        run: docker run --rm agente-ferrepro:ci python -c "import app.main, app.celery_app, app.tasks.chatwoot_tasks; print('import OK')"
+        run: docker run --rm "$IMAGE:$GITHUB_SHA" python -c "import app.main, app.celery_app, app.tasks.chatwoot_tasks; print('import OK')"
 
-  # ── Deploy ── SOLO en push a main y SOLO si 'checks' pasó. Con healthcheck + rollback.
+      - name: Login a GHCR (solo para pushear)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push a GHCR (el artefacto exacto que pasó los checks)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker push "$IMAGE:latest"
+
+  # ── Deploy ── SOLO en push a main y SOLO si 'checks' pasó. Baja la imagen de GHCR (no rebuildea).
   deploy:
     needs: checks
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy por SSH (healthcheck + rollback)
-        uses: appleboy/ssh-action@v1
+      - name: Deploy por SSH (pull de GHCR + healthcheck + rollback)
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
@@ -57,14 +76,14 @@ jobs:
             cd /opt/apps/agente-ferrepro
             export ENV_FILE=.env.prod
             export COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
+            IMAGE=ghcr.io/augustoterrera/agente-ferrepro
 
-            PREV=$(git rev-parse HEAD)          # commit actual, por si hay que volver
-            git pull --ff-only
-            docker compose up -d --build
-            # El código va montado por volumen: restart para que los procesos lo recarguen.
-            docker compose restart api worker_messages worker_outbound beat
+            PREV=$(git rev-parse HEAD)     # commit actual, por si hay que volver
+            git pull --ff-only             # trae cambios de compose (la imagen viene de GHCR)
+            docker compose pull            # baja la imagen exacta que pasó CI
+            docker compose up -d
 
-            # Healthcheck: esperar a que el api responda 200 (hasta ~30s).
+            # Healthcheck: esperar a que el api responda 200 en /health (hasta ~30s).
             ok=0
             for i in $(seq 1 10); do
               if docker compose exec -T api python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=5).status==200 else 1)" 2>/dev/null; then
@@ -74,10 +93,10 @@ jobs:
             done
 
             if [ "$ok" != "1" ]; then
-              echo "HEALTHCHECK FALLÓ -> rollback a $PREV"
+              echo "HEALTHCHECK FALLÓ -> rollback al commit/imagen previos ($PREV)"
               git reset --hard "$PREV"
-              docker compose up -d --build
-              docker compose restart api worker_messages worker_outbound beat
+              docker pull "$IMAGE:$PREV" && docker tag "$IMAGE:$PREV" "$IMAGE:latest" || true
+              docker compose up -d
               exit 1
             fi
             echo "Deploy OK y healthy en $(git rev-parse --short HEAD)"

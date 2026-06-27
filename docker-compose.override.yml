@@ -1,0 +1,28 @@
+# Override de DESARROLLO. docker compose lo auto-carga cuando NO pasás -f (o sea: en tu Mac).
+# Prod usa `-f docker-compose.yml -f docker-compose.prod.yml` (vía COMPOSE_FILE), que NO incluye
+# este archivo → en prod no hay mount: corre el código de la imagen, no el del host.
+services:
+  api:
+    volumes:
+      - ./app:/app/app    # edición en vivo: cambiás ferrepro.md / código y aplica con restart
+  worker_messages:
+    volumes:
+      - ./app:/app/app
+  worker_outbound:
+    volumes:
+      - ./app:/app/app
+  beat:
+    volumes:
+      - ./app:/app/app
+
+  # Túnel público hacia api:8000 por la red interna de Docker. Solo dev. Necesita NGROK_AUTHTOKEN.
+  # Correr con: docker compose --profile tunnel up
+  ngrok:
+    image: ngrok/ngrok:latest
+    restart: unless-stopped
+    profiles: ["tunnel"]
+    command: http api:8000 --log stdout
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN:-}
+    depends_on:
+      - api
