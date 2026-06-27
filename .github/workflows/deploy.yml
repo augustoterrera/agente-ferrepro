@@ -1,0 +1,77 @@
+name: CI + Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+# Evita que dos deploys se pisen; si llega uno nuevo, espera al anterior (no lo corta).
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  # ── Gate de calidad ── corre en cada push y PR. El deploy depende de que esto pase.
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lint (solo errores reales, sin estilo)
+        run: |
+          pip install ruff
+          ruff check --select E9,F63,F7,F82 app
+
+      - name: Build de la imagen Docker (valida Dockerfile + que las deps instalen)
+        run: docker build -t agente-ferrepro:ci .
+
+      - name: Smoke — que todos los módulos importen
+        run: docker run --rm agente-ferrepro:ci python -c "import app.main, app.celery_app, app.tasks.chatwoot_tasks; print('import OK')"
+
+  # ── Deploy ── SOLO en push a main y SOLO si 'checks' pasó. Con healthcheck + rollback.
+  deploy:
+    needs: checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy por SSH (healthcheck + rollback)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          script_stop: true
+          script: |
+            set -e
+            cd /opt/apps/agente-ferrepro
+            export ENV_FILE=.env.prod
+            export COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
+
+            PREV=$(git rev-parse HEAD)          # commit actual, por si hay que volver
+            git pull --ff-only
+            docker compose up -d --build
+            # El código va montado por volumen: restart para que los procesos lo recarguen.
+            docker compose restart api worker_messages worker_outbound beat
+
+            # Healthcheck: esperar a que el api responda 200 (hasta ~30s).
+            ok=0
+            for i in $(seq 1 10); do
+              if docker compose exec -T api python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=5).status==200 else 1)" 2>/dev/null; then
+                ok=1; break
+              fi
+              sleep 3
+            done
+
+            if [ "$ok" != "1" ]; then
+              echo "HEALTHCHECK FALLÓ -> rollback a $PREV"
+              git reset --hard "$PREV"
+              docker compose up -d --build
+              docker compose restart api worker_messages worker_outbound beat
+              exit 1
+            fi
+            echo "Deploy OK y healthy en $(git rev-parse --short HEAD)"
