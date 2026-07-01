@@ -23,8 +23,11 @@ def load_system_prompt() -> str:
     # leer un archivo chico por request es nulo (lo cachea el SO) y habilita iterar en vivo.
     return PROMPT_FILE.read_text(encoding="utf-8")
 
-# Links que el bot puede emitir aunque no vengan de una búsqueda (ubicación del local).
-FIXED_LINKS = {"https://maps.app.goo.gl/ryspgRto3yHArQYp7"}
+# Links que el bot puede emitir aunque no vengan de una búsqueda.
+FIXED_LINKS = {
+    "https://maps.app.goo.gl/ryspgRto3yHArQYp7",
+    "https://www.ferreproindustrial.com/productos/",
+}
 
 
 class AgentError(RuntimeError):
