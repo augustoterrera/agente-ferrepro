@@ -10,7 +10,7 @@ import redis
 
 from app import chat_memory
 from app.celery_app import celery_app
-from app.chatwoot import ChatwootError, build_chatwoot_client
+from app.chatwoot import ChatwootError, build_chatwoot_client, should_handoff_to_agent
 from app.chatwoot_service import process_pending_conversation_messages, sync_crm_label
 from app.classifier import CLASSIFIER_LABELS, classify
 from app.config import settings
@@ -22,6 +22,17 @@ def _chatwoot_client_for(conv):
     client = build_chatwoot_client(settings.chatwoot_url, settings.chatwoot_access_token)
     account_id = conv.account_id or settings.chatwoot_account_id
     return client, account_id
+
+
+def _handoff_if_needed(client, account_id, conv, content: str) -> bool:
+    if not should_handoff_to_agent(content):
+        return False
+    current = client.get_conversation_labels(account_id, conv.external_conversation_id)
+    labels = current if settings.apagar_bot_label in current else [*current, settings.apagar_bot_label]
+    client.set_conversation_labels(account_id, conv.external_conversation_id, labels)
+    if settings.chatwoot_assignee_id is not None:
+        client.assign_conversation(account_id, conv.external_conversation_id, settings.chatwoot_assignee_id)
+    return True
 
 logger = logging.getLogger(__name__)
 
@@ -137,8 +148,10 @@ def process_chatwoot_conversation(self, conversation_id: str) -> dict[str, objec
             outbox_id = process_pending_conversation_messages(int(conversation_id))
             if outbox_id is not None:
                 send_chatwoot_outbound_message.apply_async((str(outbox_id),), queue="chatwoot_outbound")
-                # Clasificar y etiquetar la conversación (async, no frena el reply).
-                classify_and_label_conversation.apply_async((str(conversation_id),), queue="chatwoot_outbound")
+                outbox = chat_memory.get_outbox(outbox_id)
+                if outbox and not should_handoff_to_agent(outbox["content"]):
+                    # Clasificar y etiquetar la conversación (async, no frena el reply).
+                    classify_and_label_conversation.apply_async((str(conversation_id),), queue="chatwoot_outbound")
             return {"ok": True, "conversation_id": conversation_id, "outbox_id": outbox_id}
         except Exception as exc:
             status = "failed" if self.request.retries >= settings.chatwoot_job_max_retries else "retry"
@@ -163,6 +176,11 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
     if outbox is None:
         return {"ok": False, "outbox_id": outbox_id, "status": "not_found"}
     if outbox["status"] in ("sent", "failed"):
+        if outbox["status"] == "sent":
+            conv = chat_memory.get_conversation(outbox["conversation_id"])
+            client, account_id = _chatwoot_client_for(conv)
+            if client and account_id:
+                _handoff_if_needed(client, account_id, conv, outbox["content"])
         return {"ok": outbox["status"] == "sent", "outbox_id": outbox_id, "status": f"already_{outbox['status']}"}
 
     if not chat_memory.mark_outbox_processing(int(outbox_id)):
@@ -180,12 +198,13 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
     try:
         response = client.create_outgoing_message(account_id, outbox["external_conversation_id"], outbox["content"])
         chat_memory.mark_outbox_sent(int(outbox_id), response)
-        return {"ok": True, "outbox_id": outbox_id, "status": "sent"}
     except Exception as exc:
         status = chat_memory.mark_outbox_retry_or_failed(int(outbox_id), str(exc))
         if status == "failed":
             raise
         raise self.retry(exc=exc)
+    handoff = _handoff_if_needed(client, account_id, conv, outbox["content"])
+    return {"ok": True, "outbox_id": outbox_id, "status": "sent", "handoff": handoff}
 
 
 @celery_app.task(name="app.tasks.chatwoot_tasks.classify_and_label_conversation", queue="chatwoot_outbound")

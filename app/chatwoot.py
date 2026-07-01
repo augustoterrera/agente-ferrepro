@@ -51,6 +51,10 @@ class ChatwootClient:
         data = self._request("POST", endpoint, {"labels": labels})
         return list((data or {}).get("payload") or [])
 
+    def assign_conversation(self, account_id: int | str, conversation_id: int | str, assignee_id: int | str) -> dict[str, Any]:
+        endpoint = f"{self.base_url.rstrip('/')}/api/v1/accounts/{account_id}/conversations/{conversation_id}/assignments"
+        return self._request("POST", endpoint, {"assignee_id": assignee_id})
+
     def _request(self, method: str, endpoint: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         request = Request(
             endpoint,
@@ -215,3 +219,16 @@ def chatwoot_contact_id(payload: dict[str, Any]) -> str | None:
     contact = payload.get("contact") if isinstance(payload.get("contact"), dict) else {}
     value = sender.get("id") or contact.get("id")
     return str(value) if value is not None else None
+
+
+def should_handoff_to_agent(content: str) -> bool:
+    text = content.lower()
+    # ponytail: el prompt usa esta frase para derivaciones reales; si agregan nuevas plantillas,
+    # sumar frases acá antes de inventar estado/tool-calls.
+    return "te derivo con un vendedor" in text and "si quer" not in text
+
+
+if __name__ == "__main__":
+    assert should_handoff_to_agent("Te derivo con un vendedor de FerrePro.")
+    assert not should_handoff_to_agent("Si querés, te derivo con un vendedor para revisar alternativas.")
+    print("self-check puro: OK")

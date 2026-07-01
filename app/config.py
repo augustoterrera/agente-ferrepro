@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     # Chatwoot (transporte)
     chatwoot_url: str | None = None
     chatwoot_account_id: int | None = None
+    chatwoot_assignee_id: int | None = None
     chatwoot_access_token: str | None = None
     chatwoot_webhook_secret: str | None = None
     chatwoot_webhook_timestamp_tolerance_seconds: int = 300
