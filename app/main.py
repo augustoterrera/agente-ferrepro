@@ -87,9 +87,9 @@ async def chatwoot_webhook(request: Request) -> dict[str, object]:
     if event is None:
         return {"ok": True, "handled": False, "reason": ignore_reason}
 
-    # Gate de humano: si la conversación tiene apagar_bot (lo pone un humano en Chatwoot),
+    # Gate de humano: si la conversación tiene bot_apagado (lo pone un humano en Chatwoot),
     # no hacemos nada. Las labels vienen en el payload, no hace falta pegarle a la API.
-    if settings.apagar_bot_label in conversation_labels(payload):
+    if settings.bot_apagado_label in conversation_labels(payload):
         return {"ok": True, "handled": False, "reason": "bot_off"}
 
     event_key = chatwoot_event_key(

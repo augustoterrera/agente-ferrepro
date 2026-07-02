@@ -28,7 +28,8 @@ class Settings(BaseSettings):
     # Transcripción de audios (WhatsApp → texto). Modelo barato de speech-to-text.
     transcription_model: str = "gpt-4o-mini-transcribe"
     # Etiqueta que, puesta por un humano en Chatwoot, silencia al bot (toma el control la persona).
-    apagar_bot_label: str = "apagar_bot"
+    # Nombre como estado ("el bot está apagado"): al ponerla se apaga; mientras esté, sigue apagado.
+    bot_apagado_label: str = "bot_apagado"
 
     # Búsqueda
     search_default_limit: int = 8

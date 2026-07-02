@@ -59,11 +59,16 @@ def sync_crm_contact(conversation_external_id: int | str | None, payload: dict[s
         logger.warning("crm_contact_sync_failed", extra={"conversation_id": conversation_id, "error": str(exc)})
 
 
-def sync_crm_label(conversation_external_id: int | str, label: str) -> None:
-    """Persiste la etiqueta del clasificador en crm_contacts para que la lea el dashboard.
-    Keyed por conversation_id (el contacto ya fue registrado por sync_crm_contact). Fire-and-forget."""
+def sync_crm_labels(conversation_external_id: int | str, labels: list[str]) -> None:
+    """Espeja en crm_contacts TODAS las etiquetas de la conversación (unidas por coma, como el
+    cached_label_list de Chatwoot) para que el dashboard quede sincronizado con Chatwoot. Keyed por
+    conversation_id (el contacto ya fue registrado por sync_crm_contact). Fire-and-forget."""
     try:
-        supabase.update("crm_contacts", f"conversation_id=eq.{conversation_external_id}", {"conversation_labels": label})
+        supabase.update(
+            "crm_contacts",
+            f"conversation_id=eq.{conversation_external_id}",
+            {"conversation_labels": ",".join(labels)},
+        )
     except supabase.SupabaseError as exc:
         logger.warning("crm_label_sync_failed", extra={"conversation_id": conversation_external_id, "error": str(exc)})
 

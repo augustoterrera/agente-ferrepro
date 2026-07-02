@@ -10,9 +10,9 @@ import redis
 
 from app import chat_memory
 from app.celery_app import celery_app
-from app.chatwoot import ChatwootError, build_chatwoot_client, should_handoff_to_agent
-from app.chatwoot_service import process_pending_conversation_messages, sync_crm_label
-from app.classifier import CLASSIFIER_LABELS, classify
+from app.chatwoot import ChatwootError, build_chatwoot_client, detect_handoff_flags, should_handoff_to_agent
+from app.chatwoot_service import process_pending_conversation_messages, sync_crm_labels
+from app.classifier import STAGE_LABELS, classify
 from app.config import settings
 from app.search import SearchError
 from app.supabase import SupabaseError
@@ -27,11 +27,19 @@ def _chatwoot_client_for(conv):
 def _handoff_if_needed(client, account_id, conv, content: str) -> bool:
     if not should_handoff_to_agent(content):
         return False
+    # En un handoff el clasificador no corre, así que las flags comerciales cuyas plantillas
+    # derivan a humano (mayorista/negociacion/sin_stock) las deducimos de la respuesta.
+    flags = detect_handoff_flags(content)
     current = client.get_conversation_labels(account_id, conv.external_conversation_id)
-    labels = current if settings.apagar_bot_label in current else [*current, settings.apagar_bot_label]
-    client.set_conversation_labels(account_id, conv.external_conversation_id, labels)
+    labels = list(current)
+    for label in (settings.bot_apagado_label, *flags):
+        if label not in labels:
+            labels.append(label)
+    applied = client.set_conversation_labels(account_id, conv.external_conversation_id, labels)
     if settings.chatwoot_assignee_id is not None:
         client.assign_conversation(account_id, conv.external_conversation_id, settings.chatwoot_assignee_id)
+    # Espejamos en el CRM el set final de labels para que el dashboard no quede desincronizado.
+    sync_crm_labels(conv.external_conversation_id, applied or labels)
     return True
 
 logger = logging.getLogger(__name__)
@@ -142,7 +150,7 @@ def process_chatwoot_conversation(self, conversation_id: str) -> dict[str, objec
             return {"ok": True, "conversation_id": conversation_id, "status": "db_lock_busy"}
 
         try:
-            # El gate apagar_bot se aplica en el webhook (labels vienen en el payload), así que
+            # El gate bot_apagado se aplica en el webhook (labels vienen en el payload), así que
             # si llegamos acá es porque el bot está habilitado para esta conversación.
             chat_memory.update_jobs(conv.channel, conv.external_conversation_id, "processing", worker_id=worker_id(task_id))
             outbox_id = process_pending_conversation_messages(int(conversation_id))
@@ -209,23 +217,29 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
 
 @celery_app.task(name="app.tasks.chatwoot_tasks.classify_and_label_conversation", queue="chatwoot_outbound")
 def classify_and_label_conversation(conversation_id: str) -> dict[str, object]:
-    """Clasifica la conversación (compra/asesoramiento/sin_stock/sin_etiqueta) y la etiqueta en
-    Chatwoot, preservando etiquetas manuales como apagar_bot."""
+    """Clasifica etapa (curioso/interesado/compra) + flags comerciales y las setea en Chatwoot.
+    La etapa REEMPLAZA a la anterior; las flags se ACUMULAN (sticky). Preserva bot_apagado y
+    etiquetas manuales."""
     conv = chat_memory.get_conversation(int(conversation_id))
     client, account_id = _chatwoot_client_for(conv)
     if not client or not account_id:
         return {"ok": False, "status": "chatwoot_not_configured"}
 
-    label = classify(chat_memory.recent_history(int(conversation_id), settings.chatwoot_history_limit))
-    sync_crm_label(conv.external_conversation_id, label)  # para el dashboard (fire-and-forget)
+    result = classify(chat_memory.recent_history(int(conversation_id), settings.chatwoot_history_limit))
     try:
         current = client.get_conversation_labels(account_id, conv.external_conversation_id)
-        preserved = [lbl for lbl in current if lbl not in CLASSIFIER_LABELS]
-        client.set_conversation_labels(account_id, conv.external_conversation_id, [*preserved, label])
+        # Preservamos todo lo que no sea etapa: flags previas (sticky), bot_apagado y manuales.
+        labels = [lbl for lbl in current if lbl not in STAGE_LABELS]
+        for label in (result.stage, *result.flags):
+            if label not in labels:
+                labels.append(label)
+        applied = client.set_conversation_labels(account_id, conv.external_conversation_id, labels)
     except ChatwootError as exc:
         logger.warning("set_label_failed", extra={"conversation_id": conversation_id, "error": str(exc)})
-        return {"ok": False, "status": "label_api_failed", "label": label}
-    return {"ok": True, "conversation_id": conversation_id, "label": label}
+        return {"ok": False, "status": "label_api_failed", "stage": result.stage}
+    # Espejar en el CRM el set final de labels para que el dashboard quede sincronizado (fire-and-forget).
+    sync_crm_labels(conv.external_conversation_id, applied or labels)
+    return {"ok": True, "conversation_id": conversation_id, "stage": result.stage, "flags": result.flags}
 
 
 # ── Sweepers del beat (red de seguridad de la cola) ─────────────────────────

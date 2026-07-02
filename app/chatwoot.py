@@ -228,7 +228,51 @@ def should_handoff_to_agent(content: str) -> bool:
     return "te derivo con un vendedor" in text and "si quer" not in text
 
 
+def is_no_stock_handoff(content: str) -> bool:
+    """El caso 'no hay literalmente': la respuesta deriva a un humano Y manda al cliente a las
+    sucursales de Monteagudo/Avellaneda. Se detecta por esas sucursales dentro de un handoff.
+    Las sucursales solo se nombran en esta plantilla y en la respuesta institucional —que no deriva—
+    así que 'handoff + sucursal' identifica sin falsos positivos."""
+    if not should_handoff_to_agent(content):
+        return False
+    text = content.lower()
+    return "monteagudo" in text or "avellaneda" in text
+
+
+def detect_handoff_flags(content: str) -> list[str]:
+    """Flags comerciales deducibles de la respuesta cuando hay handoff (ahí el clasificador no
+    corre). Se detectan por la plantilla que disparó, igual que should_handoff_to_agent. Solo las
+    flags cuyas plantillas derivan a humano: mayorista, negociacion y el sin_stock 'no hay
+    literalmente'. Mantener los nombres en sync con Flag en classifier.py."""
+    text = content.lower()
+    flags: list[str] = []
+    if is_no_stock_handoff(content):
+        flags.append("sin_stock")
+    if "compras por cantidad" in text or "presupuestos personalizados" in text:
+        flags.append("mayorista")
+    if "mejor condición disponible" in text or "mejor condicion disponible" in text:
+        flags.append("negociacion")
+    return flags
+
+
 if __name__ == "__main__":
     assert should_handoff_to_agent("Te derivo con un vendedor de FerrePro.")
     assert not should_handoff_to_agent("Si querés, te derivo con un vendedor para revisar alternativas.")
+    assert is_no_stock_handoff(
+        "No tengo taladro disponible. Podés consultarlo en Bernardo Monteagudo 340 o Av. Avellaneda 512. "
+        "Te derivo con un vendedor de FerrePro para que te ayude."
+    )
+    assert not is_no_stock_handoff("Te derivo con un vendedor de FerrePro para que pueda ayudarte.")
+    assert not is_no_stock_handoff("📍 Bernardo Monteagudo 340\nLunes a viernes de 9 a 17 hs.")
+    assert detect_handoff_flags(
+        "No tengo eso disponible. Podés consultarlo en Bernardo Monteagudo 340 o Av. Avellaneda 512. "
+        "Te derivo con un vendedor de FerrePro para que te ayude."
+    ) == ["sin_stock"]
+    assert detect_handoff_flags(
+        "Para compras por cantidad o presupuestos personalizados, te derivo con un vendedor de FerrePro para que lo vea con vos."
+    ) == ["mayorista"]
+    assert detect_handoff_flags(
+        "Te derivo con un vendedor de FerrePro para que pueda revisar la mejor condición disponible."
+    ) == ["negociacion"]
+    assert detect_handoff_flags("Te derivo con un vendedor de FerrePro para que pueda ayudarte.") == []
     print("self-check puro: OK")
