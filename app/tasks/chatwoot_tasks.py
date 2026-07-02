@@ -156,10 +156,9 @@ def process_chatwoot_conversation(self, conversation_id: str) -> dict[str, objec
             outbox_id = process_pending_conversation_messages(int(conversation_id))
             if outbox_id is not None:
                 send_chatwoot_outbound_message.apply_async((str(outbox_id),), queue="chatwoot_outbound")
-                outbox = chat_memory.get_outbox(outbox_id)
-                if outbox and not should_handoff_to_agent(outbox["content"]):
-                    # Clasificar y etiquetar la conversación (async, no frena el reply).
-                    classify_and_label_conversation.apply_async((str(conversation_id),), queue="chatwoot_outbound")
+                # Clasificar y etiquetar la conversación (async, no frena el reply). Corre también
+                # en handoff para no perder etapa/flags si la derivación apaga el bot.
+                classify_and_label_conversation.apply_async((str(conversation_id),), queue="chatwoot_outbound")
             return {"ok": True, "conversation_id": conversation_id, "outbox_id": outbox_id}
         except Exception as exc:
             status = "failed" if self.request.retries >= settings.chatwoot_job_max_retries else "retry"

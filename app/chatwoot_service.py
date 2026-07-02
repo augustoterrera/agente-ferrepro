@@ -7,10 +7,11 @@ from typing import Any
 
 from . import chat_memory, media, supabase
 from .agent import run_agent
-from .chatwoot import ChatwootMessageEvent, chatwoot_contact_id, message_attachments
+from .chatwoot import ChatwootMessageEvent, chatwoot_contact_id, is_handoff_acceptance, message_attachments
 from .config import settings
 
 logger = logging.getLogger(__name__)
+HANDOFF_ACCEPTED_REPLY = "Perfecto, te derivo con un vendedor de FerrePro para coordinarlo."
 
 
 def chatwoot_event_key(headers: dict[str, str | None], conversation_id: int | str, message_id: int | str | None) -> str:
@@ -125,10 +126,13 @@ def process_pending_conversation_messages(conversation_id: int) -> int | None:
 
     history = chat_memory.recent_history(conversation_id, settings.chatwoot_history_limit, exclude_ids=set(message_ids))
 
-    # Si el agente falla, propagamos: el estado retry/failed del job lo decide la task de
-    # Celery según los reintentos. Los mensajes siguen en pending (nunca los marcamos
-    # processing), así el retry los reprocesa.
-    answer = run_agent(user_content, history, images=images or None)
+    if not images and is_handoff_acceptance(user_content, history):
+        answer = HANDOFF_ACCEPTED_REPLY
+    else:
+        # Si el agente falla, propagamos: el estado retry/failed del job lo decide la task de
+        # Celery según los reintentos. Los mensajes siguen en pending (nunca los marcamos
+        # processing), así el retry los reprocesa.
+        answer = run_agent(user_content, history, images=images or None)
 
     # Si el cliente escribió MIENTRAS generábamos, esta respuesta quedó vieja: dejamos los
     # mensajes en pending (nunca los marcamos processing) y cerramos el job. La task del

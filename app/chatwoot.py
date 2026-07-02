@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import time
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -228,6 +229,45 @@ def should_handoff_to_agent(content: str) -> bool:
     return "te derivo con un vendedor" in text and "si quer" not in text
 
 
+def is_handoff_acceptance(content: str, history: list[AgentMessage]) -> bool:
+    last_assistant = next((m.content for m in reversed(history) if m.role == "assistant"), "")
+    return _offered_handoff(last_assistant) and _accepts_handoff(content)
+
+
+def _offered_handoff(content: str) -> bool:
+    text = _plain(content)
+    return "vendedor" in text and ("queres que te derive" in text or "queres que te deriven" in text)
+
+
+def _accepts_handoff(content: str) -> bool:
+    text = _plain(content)
+    if not text:
+        return False
+    if "?" in text and "deriv" not in text:
+        return False
+    if text in {"si", "dale", "ok", "okay", "bueno", "perfecto", "de una"}:
+        return True
+    return any(
+        phrase in text
+        for phrase in (
+            "si me interesa",
+            "si quiero",
+            "me interesa",
+            "quiero coordinar",
+            "quiero que me deriven",
+            "derivame",
+            "pasame con",
+            "te dije que si",
+        )
+    )
+
+
+def _plain(content: str) -> str:
+    text = unicodedata.normalize("NFKD", content.lower())
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return " ".join(text.replace("¿", "").replace("¡", "").split())
+
+
 def is_no_stock_handoff(content: str) -> bool:
     """El caso 'no hay literalmente': la respuesta deriva a un humano Y manda al cliente a las
     sucursales de Monteagudo/Avellaneda. Se detecta por esas sucursales dentro de un handoff.
@@ -258,6 +298,14 @@ def detect_handoff_flags(content: str) -> list[str]:
 if __name__ == "__main__":
     assert should_handoff_to_agent("Te derivo con un vendedor de FerrePro.")
     assert not should_handoff_to_agent("Si querés, te derivo con un vendedor para revisar alternativas.")
+    assert is_handoff_acceptance(
+        "Si me interesa",
+        [AgentMessage(role="assistant", content="¿Querés que te derive con un vendedor para coordinar la compra?")],
+    )
+    assert not is_handoff_acceptance(
+        "Sí, cuánto sale el envío?",
+        [AgentMessage(role="assistant", content="¿Querés que te derive con un vendedor para coordinar la compra?")],
+    )
     assert is_no_stock_handoff(
         "No tengo taladro disponible. Podés consultarlo en Bernardo Monteagudo 340 o Av. Avellaneda 512. "
         "Te derivo con un vendedor de FerrePro para que te ayude."

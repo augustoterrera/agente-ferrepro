@@ -28,6 +28,7 @@ FIXED_LINKS = {
     "https://maps.app.goo.gl/ryspgRto3yHArQYp7",
     "https://www.ferreproindustrial.com/productos/",
 }
+PRODUCT_URL_PREFIX = "https://www.ferreproindustrial.com/productos/"
 
 
 class AgentError(RuntimeError):
@@ -38,6 +39,8 @@ class AgentError(RuntimeError):
 class Deps:
     # Links de productos realmente devueltos por las tools este turno → set permitido del guard.
     shown_links: set[str] = field(default_factory=set)
+    # Links ya mostrados en turnos previos: no se vuelven a ofrecer salvo pedido explícito.
+    seen_links: set[str] = field(default_factory=set)
 
 
 def build_agent() -> Agent[Deps, str]:
@@ -58,10 +61,13 @@ def build_agent() -> Agent[Deps, str]:
     ) -> list[dict[str, Any]]:
         """Busca productos. Por defecto solo con stock. Pasá incluir_sin_stock=true para verificar
         si un producto existe aunque esté sin stock (devuelve en_stock por ítem)."""
-        productos = _buscar(consulta, limite=limite, solo_con_stock=not incluir_sin_stock)
+        search_limit = limite + len(ctx.deps.seen_links) if ctx.deps.seen_links and not incluir_sin_stock else limite
+        productos = _buscar(consulta, limite=search_limit, solo_con_stock=not incluir_sin_stock)
+        if ctx.deps.seen_links and not incluir_sin_stock:
+            productos = [p for p in productos if _norm_url(p.canonical_url) not in ctx.deps.seen_links][:limite]
         for p in productos:
             if p.canonical_url:
-                ctx.deps.shown_links.add(p.canonical_url)
+                ctx.deps.shown_links.add(_norm_url(p.canonical_url))
         return compact_for_llm(productos)
 
     @agent.tool
@@ -105,9 +111,10 @@ def run_agent(
     images: list[tuple[bytes, str]] | None = None,
 ) -> str:
     """`images`: lista de (bytes, media_type) para que el modelo multimodal las vea."""
+    history = history or []
     agent = build_agent()
-    deps = Deps()
-    text = _build_input(message, history or [])
+    deps = Deps(seen_links=set() if _asks_to_repeat(message) else _history_product_links(history))
+    text = _build_input(message, history)
     prompt: object = text
     if images:
         prompt = [text, *[BinaryContent(data=data, media_type=mt) for data, mt in images]]
@@ -130,24 +137,47 @@ def _build_input(message: str, history: list[AgentMessage]) -> str:
 _URL_RE = re.compile(r"https?://\S+")
 
 
+def _norm_url(url: str | None) -> str:
+    return (url or "").rstrip(".,)").rstrip("/")
+
+
+def _history_product_links(history: list[AgentMessage]) -> set[str]:
+    urls: set[str] = set()
+    for message in history:
+        for url in _URL_RE.findall(message.content):
+            clean = _norm_url(url)
+            if clean.startswith(PRODUCT_URL_PREFIX):
+                urls.add(clean)
+    return urls
+
+
+def _asks_to_repeat(message: str) -> bool:
+    text = message.lower()
+    return "link" in text or "de nuevo" in text or "otra vez" in text or "repet" in text
+
+
 def guard_links(answer: str, allowed: set[str]) -> str:
     """Saca líneas con links que el agente no obtuvo de las tools (anti-alucinación de links).
     Guard mínimo: el prompt ya prohíbe inventar; esto es la red de seguridad para el link.
     ponytail: no replica el renumerado/reparación de odranid; si hace falta, se suma."""
-    allowed_norm = {u.rstrip("/") for u in allowed}
+    allowed_norm = {_norm_url(u) for u in allowed}
     kept: list[str] = []
-    for line in answer.splitlines():
-        urls = [u.rstrip(".,)").rstrip("/") for u in _URL_RE.findall(line)]
+    for block in answer.split("\n\n"):
+        urls = [_norm_url(u) for u in _URL_RE.findall(block)]
         if urls and any(u not in allowed_norm for u in urls):
             continue
-        kept.append(line)
-    return "\n".join(kept).strip()
+        kept.append(block)
+    return "\n\n".join(kept).strip()
 
 
 if __name__ == "__main__":
     # Guard puro (sin red) siempre.
-    g = guard_links("Mirá esto\n🔗 https://ok/p1\n🔗 https://malo/x", {"https://ok/p1"})
+    g = guard_links("Mirá esto\n\n🔗 https://ok/p1\n\n🔗 https://malo/x", {"https://ok/p1"})
     assert "https://ok/p1" in g and "malo" not in g, g
+    assert _history_product_links([AgentMessage(role="assistant", content=f"🔗 {PRODUCT_URL_PREFIX}x/")]) == {
+        f"{PRODUCT_URL_PREFIX}x"
+    }
+    assert _asks_to_repeat("pasame el link de nuevo")
     print("guard puro: OK")
 
     if settings.openai_api_key and settings.supabase_url and settings.supabase_service_key:
