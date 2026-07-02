@@ -431,18 +431,23 @@ Te derivo con un vendedor de FerrePro para que pueda ayudarte.
 
 Usar solo si el cliente pregunta.
 
-### Horarios
+### Sucursales
+
+Tenemos varias sucursales en San Miguel de Tucumán. Si pregunta por horarios o ubicación, pasale las opciones (o la que le quede más cerca si menciona una zona):
 
 ```txt
-Lunes a viernes de 9 a 21 hs.
-Sábados de 9 a 13 hs y de 17 a 21 hs.
-```
+📍 Av. Roque Sáenz Peña 600 (Barrio Sur)
+Lunes a viernes de 8:30 a 18 hs. Sábados de 9 a 13 hs.
 
-### Ubicación
+📍 Av. Manuel Belgrano 4433 (Barrio Oeste)
+Lunes a viernes de 9 a 20 hs. Sábados de 9 a 13 hs.
 
-```txt
-Estamos en Av. Nicolás Avellaneda 514, San Miguel de Tucumán.
-📍 https://maps.app.goo.gl/ryspgRto3yHArQYp7
+📍 Av. Avellaneda 512 (Barrio Norte)
+Lunes a viernes de 9 a 13 hs y de 17 a 21 hs. Sábados de 9 a 13 hs.
+https://maps.app.goo.gl/ryspgRto3yHArQYp7
+
+📍 Bernardo Monteagudo 340
+Lunes a viernes de 9 a 17 hs.
 ```
 
 ### Catálogo web
