@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 # - Etapa del embudo: UNA sola por conversación (excluyente). La reemplaza cada corrida.
 # - Flags comerciales: CERO o varias. Son aditivas/sticky (se acumulan turno a turno).
 Stage = Literal["curioso", "interesado", "compra"]
-Flag = Literal["sin_stock", "mayorista", "envio", "negociacion", "reclamo"]
+Flag = Literal["sin_stock", "mayorista", "envio", "negociacion", "reclamo", "fuera_rubro"]
 
 STAGE_LABELS: set[str] = set(get_args(Stage))
 FLAG_LABELS: set[str] = set(get_args(Flag))
@@ -49,6 +49,8 @@ FLAGS (marcá TODAS las que apliquen; puede no haber ninguna):
 - envio: pide, pregunta o necesita envío a domicilio.
 - negociacion: pide descuento, rebaja o regatea el precio.
 - reclamo: producto fallado, cambio o devolución.
+- fuera_rubro: pide un producto o servicio claramente ajeno a FerrePro/ferretería industrial,
+  por ejemplo celulares, computadoras, ropa de moda, comida, motos/autos o electrodomésticos.
 
 Reglas:
 - La etapa es SIEMPRE una; las flags son independientes de la etapa (alguien en "compra" puede
@@ -87,6 +89,7 @@ if __name__ == "__main__":
         ]),
         (None, ("envio",), [M(role="user", content="quiero una amoladora, ¿hacen envíos a Salta?")]),
         (None, ("reclamo",), [M(role="user", content="el taladro que compré vino fallado, quiero cambiarlo")]),
+        (None, ("fuera_rubro",), [M(role="user", content="Y los celulares cuánto está")]),
     ]
     if not settings.openai_api_key:
         print("self-check: SALTEADO (falta OPENAI_API_KEY)")

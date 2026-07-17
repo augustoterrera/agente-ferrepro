@@ -13,6 +13,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from .config import settings
 from .models import AgentMessage
 from .search import buscar_productos as _buscar, compact_for_llm
+from .scope import decide_scope, scope_reply
 from .supabase import select as sb_select
 
 PROMPT_FILE = Path(__file__).parent / "prompts" / "ferrepro.md"
@@ -112,6 +113,9 @@ def run_agent(
 ) -> str:
     """`images`: lista de (bytes, media_type) para que el modelo multimodal las vea."""
     history = history or []
+    scoped_reply = scope_reply(decide_scope(message, history))
+    if scoped_reply:
+        return scoped_reply
     agent = build_agent()
     deps = Deps(seen_links=set() if _asks_to_repeat(message) else _history_product_links(history))
     text = _build_input(message, history)
@@ -178,6 +182,8 @@ if __name__ == "__main__":
         f"{PRODUCT_URL_PREFIX}x"
     }
     assert _asks_to_repeat("pasame el link de nuevo")
+    assert "no vendemos celulares" in run_agent("Y los celulares cuánto está")
+    assert "no vendemos celulares" in run_agent("Motorola e14")
     print("guard puro: OK")
 
     if settings.openai_api_key and settings.supabase_url and settings.supabase_service_key:
