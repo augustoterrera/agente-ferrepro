@@ -62,17 +62,26 @@ jobs:
     needs: checks
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Deploy por SSH (pull de GHCR + healthcheck + rollback)
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT || 22 }}
-          script_stop: true
+          envs: GHCR_TOKEN,GHCR_USER
           script: |
             set -e
+            # Login efímero a GHCR con el token del propio run: se emite por deploy y muere con él.
+            # Nada de PATs guardados en el VPS que se vencen y rompen el pull ("denied").
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             cd /opt/apps/agente-ferrepro
             export ENV_FILE=.env.prod
             export COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
