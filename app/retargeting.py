@@ -10,7 +10,7 @@ from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from .agent import _history_product_links
+from .agent import _history_product_links, load_system_prompt
 from .chatwoot import should_handoff_to_agent
 from .classifier import FLAG_LABELS
 from .config import settings
@@ -63,60 +63,73 @@ class Followup(BaseModel):
     mensaje: str | None = None
 
 
-REDACTOR_PROMPT = """\
-Sos Matías, asistente de ventas de FerrePro, ferretería de San Miguel de Tucumán. Escribís por
-WhatsApp en español rioplatense, con voseo.
+# Tarea del redactor. NO repite las reglas de negocio: se monta sobre el prompt principal
+# (ferrepro.md), que es la única fuente de qué puede y qué no puede prometer FerrePro. Duplicar
+# un subconjunto acá fue justamente lo que hizo que el primer dry-run ofreciera reservar un
+# producto y averiguar el origen de otro: dos cosas que el prompt principal prohíbe y que este
+# no sabía.
+REDACTOR_TAREA = """\
+---
 
-Un cliente dejó de responder a mitad de la charla. Tu tarea es doble:
-1. Decidir si vale la pena escribirle UNA sola vez para retomar.
-2. Si vale, escribir ese mensaje.
+# TAREA ESPECIAL: MENSAJE DE RECONTACTO
 
-## Cuándo NO vale la pena (vale_la_pena=false)
+Todo lo de arriba sigue valiendo —quién sos, qué vende FerrePro, qué podés prometer y qué no—,
+pero en esta tarea NO estás respondiendo un mensaje: estás decidiendo si vale la pena reabrir
+una conversación que quedó colgada, y escribiendo ese único mensaje.
 
+No tenés herramientas acá. No busques productos ni consultes nada: trabajá EXCLUSIVAMENTE con lo
+que ya está escrito en la conversación que te paso. Si un dato no está ahí, no existe.
+
+## Primero decidí: ¿vale la pena? (vale_la_pena)
+
+Decí que NO si:
 - El cliente se despidió, agradeció y cerró, o dijo que no le interesa.
 - Ya compró, ya tiene el link para comprar, o quedó en pasar por la sucursal.
-- La última respuesta del bot derivó a un vendedor: lo sigue un humano, no te metas.
+- Tu última respuesta derivó a un vendedor: lo sigue un humano, no te metas.
 - Es un reclamo, un cambio o una devolución.
-- Pidió algo fuera del rubro de ferretería.
-- No hay nada concreto que retomar: saludo suelto, charla sin producto, o una pregunta que ya
-  quedó respondida y no necesitaba respuesta del cliente.
-- El producto que buscaba está sin stock y no hay otra cosa que ofrecerle.
+- Pidió algo fuera del rubro.
+- No hay nada concreto que retomar: un saludo suelto, una charla sin producto, o una pregunta
+  que ya quedó respondida y no necesitaba respuesta del cliente.
+- Lo que buscaba está sin stock y no hay otra cosa que ofrecerle.
 
 Ante la duda, NO escribas. Un mensaje de más molesta más de lo que un mensaje de menos pierde.
 
-## Cuándo SÍ
+Decí que SÍ solo si quedó algo concreto en el aire: una opción sin elegir, una pregunta tuya sin
+contestar, un precio que no respondió.
 
-El cliente venía preguntando por un producto concreto y quedó algo en el aire: una opción sin
-elegir, una pregunta del bot sin contestar, un precio que no respondió.
+## Si va, así tiene que ser el mensaje
 
-## Cómo tiene que ser el mensaje
-
-- 1 o 2 líneas. Máximo 300 caracteres.
-- Nombrá el producto concreto que quedó pendiente, con las mismas palabras que ya usó la charla.
+- 1 o 2 líneas, máximo 300 caracteres.
+- Nombrá el producto puntual que quedó pendiente, con las mismas palabras que ya usó la charla.
 - Una sola pregunta, al final.
 - No repitas el listado de productos ni vuelvas a pegar links.
-- Entrá directo y cordial. Si la charla ya venía saludada, no saludes de nuevo.
-- No inventes precios, stock, plazos, descuentos ni promociones: solo lo que ya está en la charla.
+- Entrá directo y cordial. La charla ya venía saludada: no saludes de nuevo.
 - Nunca te disculpes por insistir, ni digas "te escribo de nuevo", ni menciones que pasó tiempo.
-- Nada de emojis de relleno; como máximo uno.
+- Como máximo un emoji.
 
-Ajustes según el contexto:
-- Si el cliente estaba regateando el precio, podés recordarle el 10% de descuento pagando en
-  efectivo en sucursal. Es el único beneficio que existe.
-- Si pidió envío, ofrecé que un vendedor se lo coordine.
-- Si preguntó por disponibilidad en una sucursal puntual, ofrecé que un vendedor lo confirme.
+## Lo que este mensaje NO puede hacer
+
+Ofrecer algo que después no vas a poder cumplir es peor que no escribir. En particular, NO
+ofrezcas reservar, apartar ni guardar un producto, NO prometas traslados entre sucursales, NO
+te comprometas a conseguir datos que no tenés (origen, procedencia, fichas técnicas,
+disponibilidad en una sucursal puntual) y NO inventes precios, stock, plazos ni descuentos.
+Si el cliente había preguntado algo de eso y quedó sin responder, no le prometas la respuesta:
+ofrecé que lo vea un vendedor, o retomá por otro lado.
 """
 
 
 def build_redactor() -> Agent[None, Followup]:
     if not settings.openai_api_key:
         raise RuntimeError("Falta OPENAI_API_KEY para redactar el follow-up.")
+    # El prompt principal se relee por corrida (igual que en el agente): si ajustás una regla de
+    # negocio en ferrepro.md, el redactor la toma sin tocar código.
+    system_prompt = load_system_prompt() + "\n\n" + REDACTOR_TAREA
     model = OpenAIChatModel(settings.retargeting_model, provider=OpenAIProvider(api_key=settings.openai_api_key))
     model_settings = None
     effort = settings.retargeting_reasoning_effort
     if effort and (settings.retargeting_model.startswith("gpt-5") or settings.retargeting_model.startswith("o")):
         model_settings = OpenAIChatModelSettings(openai_reasoning_effort=effort)
-    return Agent(model=model, output_type=Followup, system_prompt=REDACTOR_PROMPT, model_settings=model_settings)
+    return Agent(model=model, output_type=Followup, system_prompt=system_prompt, model_settings=model_settings)
 
 
 def compose_followup(
@@ -227,10 +240,15 @@ def veto_por_conversacion(history: list[AgentMessage], stage: str | None) -> str
     ultimo_bot = next((m.content for m in reversed(history) if m.role == "assistant"), "")
     if should_handoff_to_agent(ultimo_bot):
         return "el último mensaje del bot fue una derivación a un vendedor"
-    # "curioso" es el cajón de sastre del clasificador: solo lo perseguimos si el bot llegó a
-    # mostrarle productos (hay links en la charla). Si no, no hay nada concreto que retomar.
-    if stage == "curioso" and not _mostro_productos(history):
-        return "curioso sin productos mostrados"
+    # Si el bot nunca llegó a mostrarle un producto, no hay nada concreto que retomar: lo único
+    # que saldría es un "¿qué estás buscando?", que es spam.
+    #
+    # Cubre "curioso" (el cajón de sastre del clasificador) y también las conversaciones SIN
+    # clasificar. Eso último no es teórico: las charlas anteriores al deploy tienen stage=None
+    # porque el clasificador todavía no las espejó al estado, y ahí el redactor —que hereda el
+    # prompt de ventas— tiende a querer engancharlas igual.
+    if stage in (None, "curioso") and not _mostro_productos(history):
+        return f"{stage or 'sin clasificar'} sin productos mostrados"
     return None
 
 
@@ -309,7 +327,9 @@ if __name__ == "__main__":
         AgentMessage(role="assistant", content="Sí: https://www.ferreproindustrial.com/productos/amoladora-x"),
     ]
     assert veto_por_conversacion(charla, "curioso") is None
+    assert veto_por_conversacion(charla, None) is None, "con productos mostrados, sin clasificar, sí va"
     assert veto_por_conversacion([AgentMessage(role="user", content="hola")], "curioso")
+    assert veto_por_conversacion([AgentMessage(role="user", content="hola")], None), "sin clasificar y sin productos: no"
     assert contact_name({"sender": {"name": "Juan Pérez"}}) == "Juan"
     assert contact_name({"sender": {"name": "+54 381 555 1234"}}) is None
     print("retargeting puro: OK")
