@@ -4,11 +4,12 @@ import logging
 import socket
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Iterator
 
 import redis
 
-from app import chat_memory
+from app import chat_memory, notifier, retargeting
 from app.celery_app import celery_app
 from app.chatwoot import ChatwootError, build_chatwoot_client, detect_handoff_flags, should_handoff_to_agent
 from app.chatwoot_service import process_pending_conversation_messages, sync_crm_labels
@@ -49,7 +50,12 @@ RETRYABLE = (SupabaseError, SearchError, ChatwootError)
 
 # Reintento para los sweepers del beat: un 502/blip transitorio de Supabase se cura solo en
 # pocos segundos (1+2+4s). Solo alerta si sigue fallando tras los retries (outage real).
-SWEEPER_RETRY = dict(autoretry_for=RETRYABLE, retry_backoff=True, retry_jitter=True, max_retries=3)
+SWEEPER_RETRY = dict(
+    autoretry_for=(*RETRYABLE, redis.RedisError),
+    retry_backoff=True,
+    retry_jitter=True,
+    max_retries=3,
+)
 
 
 def _redis() -> redis.Redis:
@@ -182,7 +188,7 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
     outbox = chat_memory.get_outbox(int(outbox_id))
     if outbox is None:
         return {"ok": False, "outbox_id": outbox_id, "status": "not_found"}
-    if outbox["status"] in ("sent", "failed"):
+    if outbox["status"] in ("sent", "failed", "cancelled"):
         if outbox["status"] == "sent":
             conv = chat_memory.get_conversation(outbox["conversation_id"])
             client, account_id = _chatwoot_client_for(conv)
@@ -190,7 +196,8 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
                 _handoff_if_needed(client, account_id, conv, outbox["content"])
         return {"ok": outbox["status"] == "sent", "outbox_id": outbox_id, "status": f"already_{outbox['status']}"}
 
-    if not chat_memory.mark_outbox_processing(int(outbox_id)):
+    previous_status = str(outbox["status"])
+    if not chat_memory.mark_outbox_processing(int(outbox_id), settings.chatwoot_stale_processing_minutes):
         return {"ok": True, "outbox_id": outbox_id, "status": "already_claimed"}
 
     conv = chat_memory.get_conversation(outbox["conversation_id"])
@@ -203,10 +210,45 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
         raise self.retry(countdown=settings.chatwoot_debounce_retry_seconds)
 
     try:
-        response = client.create_outgoing_message(account_id, outbox["external_conversation_id"], outbox["content"])
-        chat_memory.mark_outbox_sent(int(outbox_id), response)
+        is_retargeting = str(outbox.get("idempotency_key") or "").startswith("retargeting:")
+        # Entrega dudosa: ya hubo intentos, o el claim anterior quedó colgado en processing. En
+        # los dos casos el POST pudo haber llegado y haberse perdido solo la confirmación.
+        # Aplica a TODO el outbound, no solo al retargeting: recibir dos veces la misma respuesta
+        # es igual de molesto. El chequeo cuesta una llamada y solo corre en estos casos raros.
+        uncertain_delivery = bool(outbox["attempts"]) or previous_status == "processing"
+        already_delivered = uncertain_delivery and client.has_outgoing_message(
+            account_id,
+            outbox["external_conversation_id"],
+            outbox["content"],
+            created_after=str(outbox.get("created_at") or ""),
+        )
+        if already_delivered:
+            logger.info("outbox_ya_estaba_en_chatwoot", extra={"outbox_id": outbox_id})
+            chat_memory.mark_outbox_sent(int(outbox_id), {"deduplicado": True})
+        else:
+            # La cola pudo demorarse y el cliente contestar antes del POST. La RPC serializa este
+            # chequeo contra el intake; si retomó, el follow-up pendiente se cancela.
+            if is_retargeting and chat_memory.cancel_retargeting_if_resumed(int(outbox_id)):
+                logger.info("retargeting_cancelado_por_respuesta", extra={"outbox_id": outbox_id})
+                return {"ok": True, "outbox_id": outbox_id, "status": "cancelled"}
+            response = client.create_outgoing_message(
+                account_id, outbox["external_conversation_id"], outbox["content"]
+            )
+            chat_memory.mark_outbox_sent(int(outbox_id), response)
     except Exception as exc:
         status = chat_memory.mark_outbox_retry_or_failed(int(outbox_id), str(exc))
+        if status in {"sent", "cancelled"}:
+            handoff = (
+                _handoff_if_needed(client, account_id, conv, outbox["content"])
+                if status == "sent"
+                else False
+            )
+            return {
+                "ok": status == "sent",
+                "outbox_id": outbox_id,
+                "status": f"already_{status}",
+                "handoff": handoff,
+            }
         if status == "failed":
             raise
         raise self.retry(exc=exc)
@@ -225,11 +267,13 @@ def classify_and_label_conversation(conversation_id: str) -> dict[str, object]:
         return {"ok": False, "status": "chatwoot_not_configured"}
 
     result = classify(chat_memory.recent_history(int(conversation_id), settings.chatwoot_history_limit))
+    reactivado = _retargeting_reply_patch(conv)
     try:
         current = client.get_conversation_labels(account_id, conv.external_conversation_id)
         # Preservamos todo lo que no sea etapa: flags previas (sticky), bot_apagado y manuales.
         labels = [lbl for lbl in current if lbl not in STAGE_LABELS]
-        for label in (result.stage, *result.flags):
+        extra = (settings.reactivado_label,) if reactivado else ()
+        for label in (result.stage, *result.flags, *extra):
             if label not in labels:
                 labels.append(label)
         applied = client.set_conversation_labels(account_id, conv.external_conversation_id, labels)
@@ -238,7 +282,27 @@ def classify_and_label_conversation(conversation_id: str) -> dict[str, object]:
         return {"ok": False, "status": "label_api_failed", "stage": result.stage}
     # Espejar en el CRM el set final de labels para que el dashboard quede sincronizado (fire-and-forget).
     sync_crm_labels(conv.external_conversation_id, applied or labels)
+    chat_memory.save_classification(
+        int(conversation_id),
+        result.stage,
+        list(result.flags),
+        list(applied or labels),
+        extra={"retargeting": reactivado} if reactivado else None,
+    )
     return {"ok": True, "conversation_id": conversation_id, "stage": result.stage, "flags": result.flags}
+
+
+def _retargeting_reply_patch(conv) -> dict[str, object] | None:
+    """Si a esta conversación le mandamos un follow-up y ahora el cliente escribió, devuelve el
+    objeto `retargeting` actualizado (merge shallow → hay que reescribirlo completo).
+
+    El clasificador corre solo cuando el cliente escribe, y el follow-up no lo dispara, así que
+    llegar acá con un follow-up enviado ya implica que contestó. El número fino del funnel lo
+    calcula chat_retargeting_stats comparando timestamps."""
+    rt = (conv.state or {}).get("retargeting")
+    if not isinstance(rt, dict) or rt.get("decision") != "enviado" or rt.get("respondio"):
+        return None
+    return {**rt, "respondio": True}
 
 
 # ── Sweepers del beat (red de seguridad de la cola) ─────────────────────────
@@ -252,7 +316,10 @@ def retry_stale_processing_jobs() -> dict[str, object]:
 
 @celery_app.task(name="app.tasks.chatwoot_tasks.dispatch_pending_outbox_messages", queue="chatwoot_outbound", **SWEEPER_RETRY)
 def dispatch_pending_outbox_messages() -> dict[str, object]:
-    rows = chat_memory.pending_outbox(settings.channel)
+    rows = chat_memory.pending_outbox(
+        settings.channel,
+        stale_minutes=settings.chatwoot_stale_processing_minutes,
+    )
     for row in rows:
         send_chatwoot_outbound_message.apply_async((str(row["id"]),), queue="chatwoot_outbound")
     return {"ok": True, "dispatched": len(rows)}
@@ -270,3 +337,204 @@ def requeue_stuck_conversation_jobs() -> dict[str, object]:
 @celery_app.task(name="app.tasks.chatwoot_tasks.cleanup_expired_locks", queue="chatwoot_messages", **SWEEPER_RETRY)
 def cleanup_expired_locks() -> dict[str, object]:
     return {"ok": True, "cleaned": chat_memory.cleanup_expired_locks()}
+
+
+# ── Retargeting ─────────────────────────────────────────────────────────────
+SWEEP_LOCK_KEY = "chatwoot:retargeting:sweep"
+
+
+@celery_app.task(name="app.tasks.chatwoot_tasks.sweep_retargeting", queue="chatwoot_outbound", **SWEEPER_RETRY)
+def sweep_retargeting() -> dict[str, object]:
+    """Follow-up ÚNICO a leads que se colgaron a mitad de charla.
+
+    Tres capas de filtro: la RPC (silencio + ventana de 24h de WhatsApp + nunca evaluada), las
+    reglas de app/retargeting.py (etiquetas, derivación a humano) y un LLM que decide si vale la
+    pena y escribe el mensaje con el contexto real. Solo dentro del horario comercial de Tucumán.
+    """
+    if not settings.retargeting_enabled:
+        return {"ok": True, "status": "disabled"}
+    if not retargeting.en_horario_de_envio():
+        return {"ok": True, "status": "fuera_de_horario"}
+
+    client = build_chatwoot_client(settings.chatwoot_url, settings.chatwoot_access_token)
+    if client is None:
+        return {"ok": False, "status": "chatwoot_no_configurado"}
+
+    dry_run = settings.retargeting_dry_run
+    # En dry-run marcamos en otra clave del state: así, al prender el envío real, las mismas
+    # conversaciones siguen siendo candidatas (la simulación no las quema).
+    state_key = "retargeting_dryrun" if dry_run else "retargeting"
+    # Sin cupo NO cortamos acá: igual recorremos para contar a los que se pierden y avisar.
+    cupo = max(0, settings.retargeting_daily_cap - chat_memory.retargeting_sent_count(settings.channel))
+
+    with _sweep_lock() as acquired:
+        if not acquired:
+            return {"ok": True, "status": "ya_corriendo"}
+        return _run_sweep(client, state_key=state_key, dry_run=dry_run, cupo=cupo)
+
+
+def _run_sweep(client, *, state_key: str, dry_run: bool, cupo: int) -> dict[str, object]:
+    resumen = {"candidatos": 0, "enviados": 0, "descartados": 0, "diferidos": 0, "fallidos": 0, "perdidos_por_cap": 0}
+    candidates = chat_memory.retargeting_candidates(
+        settings.channel,
+        window_hours=settings.retargeting_window_hours,
+        min_silence_hours=settings.retargeting_min_silence_hours,
+        state_key=state_key,
+        limit=settings.retargeting_batch_limit,
+    )
+    for cand in candidates:
+        resumen["candidatos"] += 1
+        if resumen["enviados"] >= cupo:
+            # Sin cupo. Solo contamos como perdido al que ya no tiene NINGUNA corrida por delante
+            # (es_perdida_definitiva, no momento_de_enviar): si todavía le queda ventana, el
+            # próximo sweep lo agarra con el cupo del día siguiente y no hay nada que alertar.
+            cierre = _parse_ts(cand.get("window_closes_at"))
+            if cierre is not None and retargeting.es_perdida_definitiva(cierre):
+                resumen["perdidos_por_cap"] += 1
+            continue
+        resumen[_procesar_candidato(client, cand, state_key=state_key, dry_run=dry_run)] += 1
+
+    logger.info("retargeting_sweep", extra={**resumen, "dry_run": dry_run})
+    _alertar_leads_perdidos(resumen, cupo=cupo)
+    return {"ok": True, "dry_run": dry_run, **resumen}
+
+
+def _alertar_leads_perdidos(resumen: dict[str, int], *, cupo: int) -> None:
+    """Un lead que se pierde tiene que doler, no pasar en un log. Los dos casos son terminales:
+    el candidato estaba en su última corrida antes de que cerrara la ventana de 24h de Meta, así
+    que no hay próximo sweep que lo recupere."""
+    perdidos = resumen["perdidos_por_cap"] + resumen["fallidos"]
+    if not perdidos:
+        return
+    notifier.notify_error(
+        f"retargeting: {perdidos} lead(s) quedaron sin contactar",
+        detalle=(
+            "Se les cerró la ventana de 24h de Meta sin follow-up: no se les puede escribir "
+            "nunca más.\n"
+            f"- {resumen['perdidos_por_cap']} por el cap diario → subí RETARGETING_DAILY_CAP "
+            f"(cupo restante de hoy era {cupo}).\n"
+            f"- {resumen['fallidos']} por fallas técnicas (Chatwoot, redactor o lock ocupado)."
+        ),
+        contexto={"candidatos": resumen["candidatos"], "enviados": resumen["enviados"]},
+    )
+
+
+def _procesar_candidato(client, cand: dict, *, state_key: str, dry_run: bool) -> str:
+    """Evalúa un candidato y, si corresponde, encola el follow-up.
+    Devuelve 'enviados', 'descartados' o 'diferidos' (para el resumen del sweep)."""
+    cid = int(cand["conversation_id"])
+    state = cand.get("state") or {}
+
+    # ¿Es esta la última corrida antes de que cierre la ventana de Meta? Si todavía queda otra,
+    # esperamos: el recontacto se manda lo más tarde posible. Va primero de todo porque descarta
+    # a casi todos los candidatos y no cuesta nada. Sin marcar: siguen siendo candidatos.
+    cierre = _parse_ts(cand.get("window_closes_at"))
+    if cierre is None or not retargeting.momento_de_enviar(cierre):
+        return "diferidos"
+
+    # Pre-filtro gratis con las etiquetas espejadas en el state por el clasificador.
+    motivo = retargeting.veto_por_etiquetas(retargeting.state_labels(state))
+    if motivo:
+        return _descartar(cid, state_key, motivo)
+
+    # Verdad al momento del envío: un humano pudo tomar la conversación (bot_apagado) después del
+    # último mensaje, y ahí no nos metemos. Se chequea antes del LLM para no gastar tokens.
+    account_id = cand.get("account_id") or settings.chatwoot_account_id
+    try:
+        labels = client.get_conversation_labels(account_id, cand["external_conversation_id"])
+    except ChatwootError as exc:
+        # Sin marcar: se reintenta. Solo es pérdida (y alerta) si ya no queda ninguna corrida.
+        logger.warning("retargeting_labels_failed", extra={"conversation_id": cid, "error": str(exc)})
+        return "fallidos" if retargeting.es_perdida_definitiva(cierre) else "diferidos"
+    motivo = retargeting.veto_por_etiquetas(labels)
+    if motivo:
+        return _descartar(cid, state_key, motivo)
+
+    history = chat_memory.recent_history(cid, settings.chatwoot_history_limit)
+    stage = retargeting.state_stage(state)
+    motivo = retargeting.veto_por_conversacion(history, stage)
+    if motivo:
+        return _descartar(cid, state_key, motivo)
+
+    # El redactor tarda segundos: una falla técnica acá NO descarta al lead (se reintenta).
+    try:
+        followup = retargeting.compose_followup(
+            history,
+            nombre=retargeting.contact_name(chat_memory.last_user_payload(cid)),
+            stage=stage,
+            flags=retargeting.state_flags(state),
+        )
+    except retargeting.RedactorError as exc:
+        logger.warning("retargeting_redactor_failed", extra={"conversation_id": cid, "error": str(exc)})
+        return "fallidos" if retargeting.es_perdida_definitiva(cierre) else "diferidos"
+    if not (followup.vale_la_pena and followup.mensaje):
+        return _descartar(cid, state_key, followup.motivo)
+
+    if dry_run:
+        chat_memory.mark_retargeting(cid, state_key, "enviado", followup.motivo, followup.mensaje)
+        logger.info("retargeting_simulado", extra={"conversation_id": cid, "mensaje": followup.mensaje})
+        return "enviados"
+
+    # Todo lo anterior (Chatwoot + LLM) llevó segundos sobre una foto de la DB, y el cliente pudo
+    # contestar en el medio. La RPC comparte el lock de conversación con el intake y confirma
+    # validación + outbox + estado en una transacción (ver migración 002).
+    resultado = chat_memory.commit_retargeting(
+        conversation_id=cid,
+        external_conversation_id=cand["external_conversation_id"],
+        channel=cand["channel"],
+        content=followup.mensaje,
+        idempotency_key=f"retargeting:{cid}",
+        state_key=state_key,
+        motivo=followup.motivo,
+        last_assistant_at=str(cand.get("last_assistant_at") or ""),
+    )
+    estado = str(resultado.get("status") or "")
+    if estado == "retomada":
+        logger.info("retargeting_conversacion_retomada", extra={"conversation_id": cid})
+        return _descartar(cid, state_key, "el cliente volvió a escribir mientras redactábamos")
+    if estado not in {"creado", "ya_existia"}:
+        raise SupabaseError(f"chat_retargeting_commit devolvió status inválido: {estado!r}")
+
+    outbox_id = resultado.get("outbox_id")
+    if outbox_id is None:
+        raise SupabaseError("chat_retargeting_commit no devolvió outbox_id")
+    send_chatwoot_outbound_message.apply_async((str(outbox_id),), queue="chatwoot_outbound")
+    logger.info("retargeting_encolado", extra={"conversation_id": cid, "motivo": followup.motivo, "estado": estado})
+    return "enviados"
+
+
+def _parse_ts(value: object) -> datetime | None:
+    """Timestamptz de PostgREST → datetime aware. Si viene raro, None (el candidato se difiere)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning("retargeting_timestamp_invalido", extra={"value": value})
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _descartar(conversation_id: int, state_key: str, motivo: str) -> str:
+    chat_memory.mark_retargeting(conversation_id, state_key, "descartado", motivo)
+    logger.info("retargeting_descartado", extra={"conversation_id": conversation_id, "motivo": motivo})
+    return "descartados"
+
+
+@contextmanager
+def _sweep_lock() -> Iterator[bool]:
+    """Evita que dos sweeps solapados paguen dos veces las llamadas al LLM (el envío ya es
+    idempotente por el idempotency_key del outbox). Sin Redis se frena: el cap diario es una
+    barrera de seguridad y no conviene degradarlo a múltiples sweeps concurrentes."""
+    client = _redis()
+    value = worker_id()
+    acquired = bool(client.set(SWEEP_LOCK_KEY, value, nx=True, ex=600))
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                if client.get(SWEEP_LOCK_KEY) == value:
+                    client.delete(SWEEP_LOCK_KEY)
+            except redis.RedisError:
+                logger.warning("retargeting_sweep_lock_release_failed")

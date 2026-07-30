@@ -13,9 +13,10 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=waichatt-finanzas_default"
-      # Solo /webhooks queda público (incluye /webhooks/chatwoot y /webhooks/chatwoot/health).
-      # El resto no se rutea. Webhook en Chatwoot: https://ferrepro.terreraaugusto.com/webhooks/chatwoot?token=<secret>
-      - "traefik.http.routers.ferrepro.rule=Host(`ferrepro.terreraaugusto.com`) && PathPrefix(`/webhooks`)"
+      # Solo /webhooks y /admin quedan públicos. El resto no se rutea.
+      # Webhook en Chatwoot: https://ferrepro.terreraaugusto.com/webhooks/chatwoot?token=<secret>
+      # /admin exige el header x-admin-token y responde 404 si ADMIN_TOKEN no está seteado.
+      - "traefik.http.routers.ferrepro.rule=Host(`ferrepro.terreraaugusto.com`) && (PathPrefix(`/webhooks`) || PathPrefix(`/admin`))"
       - "traefik.http.routers.ferrepro.entrypoints=websecure"
       - "traefik.http.routers.ferrepro.tls.certresolver=letsencrypt"
       - "traefik.http.services.ferrepro.loadbalancer.server.port=8000"

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
+import secrets
 import traceback
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
@@ -122,3 +123,21 @@ async def chatwoot_webhook(request: Request) -> dict[str, object]:
 @app.get("/webhooks/chatwoot/health")
 def webhook_health() -> dict[str, object]:
     return {"ok": True, "endpoint": "/webhooks/chatwoot", "channel": settings.channel}
+
+
+@app.get("/admin/retargeting-stats")
+def retargeting_stats(x_admin_token: str = Header(default="")) -> dict[str, object]:
+    """Funnel del retargeting: enviados, cuántos contestaron y cuántos llegaron a etapa compra.
+    Sin ADMIN_TOKEN configurado el endpoint no existe (404), así no queda abierto por olvido."""
+    if not settings.admin_token:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not secrets.compare_digest(x_admin_token, settings.admin_token):
+        raise HTTPException(status_code=401, detail="Token inválido")
+    from . import chat_memory
+
+    return {
+        "ok": True,
+        "enabled": settings.retargeting_enabled,
+        "dry_run": settings.retargeting_dry_run,
+        **chat_memory.retargeting_stats(settings.channel),
+    }

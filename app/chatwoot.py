@@ -6,6 +6,7 @@ import json
 import time
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -40,6 +41,43 @@ class ChatwootClient:
         )
         body = {"content": content, "message_type": "outgoing", "private": False, "content_type": "text"}
         return self._request("POST", endpoint, body)
+
+    def has_outgoing_message(
+        self,
+        account_id: int | str,
+        conversation_id: int | str,
+        content: str,
+        *,
+        created_after: str,
+    ) -> bool:
+        """¿Ya salió este texto en esta conversación después de `created_after`?
+
+        La API de mensajes de Chatwoot no acepta clave de idempotencia: si el POST llega pero se
+        pierde la confirmación, el reintento lo mandaría de nuevo y el cliente lo vería dos veces.
+        Esto lo detecta antes de duplicar.
+
+        Se acota a la ventana de este outbox porque comparar contra todo el historial daría falsos
+        positivos cuando el bot repite una respuesta legítima."""
+        endpoint = (
+            f"{self.base_url.rstrip('/')}/api/v1/accounts/{account_id}"
+            f"/conversations/{conversation_id}/messages"
+        )
+        data = self._request("GET", endpoint)
+        payload = (data or {}).get("payload")
+        if not isinstance(payload, list):
+            return False
+        objetivo = content.strip()
+        desde = _epoch(created_after)
+        if desde is None:
+            return False
+        return any(
+            _role(m) == "assistant"
+            and str(m.get("content") or "").strip() == objetivo
+            and (creado := _epoch(m.get("created_at"))) is not None
+            and creado >= desde - 5
+            for m in payload
+            if isinstance(m, dict)
+        )
 
     def get_conversation_labels(self, account_id: int | str, conversation_id: int | str) -> list[str]:
         endpoint = f"{self.base_url.rstrip('/')}/api/v1/accounts/{account_id}/conversations/{conversation_id}/labels"
@@ -190,6 +228,24 @@ def _role(message: dict[str, Any]) -> str | None:
     if message_type in ("outgoing", 1):
         return "assistant"
     return None
+
+
+def _epoch(value: object) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def message_attachments(payload: dict[str, Any]) -> list[dict[str, Any]]:

@@ -77,29 +77,24 @@ def sync_crm_labels(conversation_external_id: int | str, labels: list[str]) -> N
 def persist_incoming_chatwoot_event(
     event_key: str, event: ChatwootMessageEvent, payload: dict[str, Any]
 ) -> tuple[bool, chat_memory.Conversation, int | None]:
-    """Dedup + persistencia del mensaje entrante. Devuelve (es_nuevo, conversación, job_id)."""
-    is_new = chat_memory.mark_event_received(
-        event_key, settings.channel, event.conversation_id, event.message_id, payload
-    )
-    conversation = chat_memory.get_or_create_conversation(
-        settings.channel,
-        event.conversation_id,
+    """Intake atómico. Devuelve (es_nuevo, conversación, job_id)."""
+    is_new, conversation, job_id = chat_memory.persist_incoming_event(
+        event_key=event_key,
+        channel=settings.channel,
+        external_conversation_id=event.conversation_id,
         external_contact_id=chatwoot_contact_id(payload),
         account_id=event.account_id or (str(settings.chatwoot_account_id) if settings.chatwoot_account_id else None),
-    )
-    if not is_new:
-        return False, conversation, None
-
-    chat_memory.add_message(
-        conversation.id, "user", event.content,
         external_message_id=str(event.message_id) if event.message_id is not None else None,
-        processing_status="pending", raw_payload=payload,
+        content=event.content,
+        raw_payload=payload,
+        max_attempts=settings.chatwoot_job_max_retries,
     )
-    job_id = chat_memory.enqueue_webhook_job(
-        event_key, settings.channel, event.conversation_id, event.message_id, payload
-    )
-    logger.info("chatwoot_webhook_queued", extra={"event_key": event_key, "conversation_id": conversation.id, "job_id": job_id})
-    return True, conversation, job_id
+    if is_new:
+        logger.info(
+            "chatwoot_webhook_queued",
+            extra={"event_key": event_key, "conversation_id": conversation.id, "job_id": job_id},
+        )
+    return is_new, conversation, job_id
 
 
 def process_pending_conversation_messages(conversation_id: int) -> int | None:

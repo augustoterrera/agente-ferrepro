@@ -1,10 +1,10 @@
 
 -- RESET (opcional): si querés recrearlas desde cero, descomentá este bloque.
-drop table if exists public.chat_outbox_messages cascade;
-drop table if exists public.chat_webhook_jobs cascade;
-drop table if exists public.chat_processed_events cascade;
-drop table if exists public.chat_messages cascade;
-drop table if exists public.chat_conversations cascade;
+-- drop table if exists public.chat_outbox_messages cascade;
+-- drop table if exists public.chat_webhook_jobs cascade;
+-- drop table if exists public.chat_processed_events cascade;
+-- drop table if exists public.chat_messages cascade;
+-- drop table if exists public.chat_conversations cascade;
 
 create table if not exists public.chat_conversations (
   id bigserial primary key,

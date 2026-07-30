@@ -29,6 +29,7 @@ celery_app.conf.update(
         "app.tasks.chatwoot_tasks.requeue_stuck_conversation_jobs": {"queue": "chatwoot_messages"},
         "app.tasks.chatwoot_tasks.dispatch_pending_outbox_messages": {"queue": "chatwoot_outbound"},
         "app.tasks.chatwoot_tasks.cleanup_expired_locks": {"queue": "chatwoot_messages"},
+        "app.tasks.chatwoot_tasks.sweep_retargeting": {"queue": "chatwoot_outbound"},
     },
     beat_schedule={
         # Red de seguridad de la cola: si Redis pierde una task, el job persistido en la DB
@@ -48,6 +49,13 @@ celery_app.conf.update(
         "cleanup-expired-locks": {
             "task": "app.tasks.chatwoot_tasks.cleanup_expired_locks",
             "schedule": crontab(minute="*/15"),
+        },
+        # Retargeting: el beat corre en hora de Tucumán (timezone de arriba). Este crontab solo
+        # evita ticks al vacío de madrugada; el corte fino (8 a 22, todos los días) lo decide
+        # en_horario_de_envio() dentro de la task.
+        "sweep-retargeting": {
+            "task": "app.tasks.chatwoot_tasks.sweep_retargeting",
+            "schedule": crontab(minute=f"*/{settings.retargeting_sweep_minutes}", hour="8-21"),
         },
     },
 )

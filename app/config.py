@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -62,6 +64,41 @@ class Settings(BaseSettings):
     chatwoot_job_max_retries: int = 5
     chatwoot_outbox_max_retries: int = 5
     chatwoot_stale_processing_minutes: int = 15
+
+    # ── Retargeting (seguimiento one-shot a leads que se colgaron) ──────────────
+    # Apagado por default: se prende recién después de validar a quién elige en dry-run.
+    retargeting_enabled: bool = False
+    # Dry-run: evalúa y redacta pero NO envía (guarda el mensaje en state.retargeting_dryrun).
+    # Correlo así unos días y mirá /admin/retargeting-stats antes de escribirle a clientes reales.
+    retargeting_dry_run: bool = True
+    # Ventana de texto libre de WhatsApp Cloud API: 24h desde el último mensaje del CLIENTE.
+    # Fuera de eso Meta rechaza el mensaje (haría falta una plantilla aprobada). El recontacto
+    # se manda lo más tarde posible DENTRO de esa ventana (≈22-23h después), no a las pocas
+    # horas: la idea es dar tiempo real a que el cliente conteste solo.
+    retargeting_window_hours: float = 24
+    # Colchón contra el cierre: no mandamos al filo (hay cola, reintentos y latencia de Meta).
+    retargeting_safety_margin_hours: float = 1
+    # Piso: nunca escribimos a alguien recién atendido.
+    retargeting_min_silence_hours: float = 2
+    # Cada cuánto corre el sweep. Tiene que coincidir con el crontab del beat (celery_app.py lo
+    # deriva de acá): con esto se calcula si esta corrida es la última antes del cierre.
+    # `*/N` reinicia en cada hora; N debe dividir 60 para que proxima_oportunidad() coincida
+    # exactamente con los ticks reales del beat.
+    retargeting_sweep_minutes: Literal[1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30] = 20
+    retargeting_batch_limit: int = 25
+    # Techo de follow-ups por día (rolling 24h). Rienda anti-blast si algo se descontrola.
+    retargeting_daily_cap: int = 40
+    # Juez + redactor del follow-up. gpt-5-mini por lo mismo que el agente: gpt-4.1-mini falla
+    # las reglas condicionales (acá: cuándo NO escribir). Es batch, la latencia no importa.
+    retargeting_model: str = "gpt-5-mini"
+    retargeting_reasoning_effort: str | None = "low"
+    # Etiqueta manual en Chatwoot para excluir una conversación del retargeting.
+    no_retargeting_label: str = "no_retargeting"
+    # Etiqueta que se agrega cuando el cliente contesta el follow-up (visibilidad para el vendedor).
+    reactivado_label: str = "reactivado"
+
+    # Token del endpoint /admin/*. Sin token, el endpoint responde 404 (no existe).
+    admin_token: str | None = None
 
     # Alertas por Telegram (opcional). Sin token/chat → no-op. Avisa en fallos finales de tasks
     # y excepciones no manejadas de la API.
