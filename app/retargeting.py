@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent
+from pydantic_ai import Agent, ModelRetry
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -47,6 +48,24 @@ ETIQUETAS_QUE_VETAN: dict[str, str] = {
 # no soporta maxLength, así que se valida apenas llega la salida estructurada.
 MENSAJE_OBJETIVO_CHARS = 300
 MENSAJE_MAX_CHARS = 600
+
+
+# Red de seguridad sobre la salida del redactor. El prompt ya prohíbe estas promesas, pero no
+# alcanza: con una pregunta del cliente sin responder ("de dónde son"), el modelo insiste en
+# ofrecer averiguarlo. Acá se detecta y se le pide que reescriba, igual que guard_links() en el
+# agente. Un follow-up es one-shot: si promete algo que FerrePro no hace, no hay segundo intento.
+PROMESAS_PROHIBIDAS = re.compile(
+    r"\b(reserv\w+|apart(?:o|ar|amos|ada?)|procedencia|ficha\s+t[eé]cnica|traslad\w+)\b"
+    # Compromiso en primera persona de conseguir un dato. El filtro de vocabulario solo no
+    # alcanzaba: sacándole "origen", el modelo pasaba a "¿querés que te confirme de dónde son?",
+    # que promete exactamente lo mismo.
+    r"|\bte\s+(?:lo\s+|la\s+|los\s+|las\s+)?(?:confirm|averigu|consig|pas|dig|busc)\w*",
+    re.IGNORECASE,
+)
+
+# La derivación a un vendedor sí es una salida válida (está en el prompt principal), así que un
+# mensaje que deriva no se marca aunque contenga alguna de esas formas.
+DERIVA_A_VENDEDOR = re.compile(r"\bvendedor\b", re.IGNORECASE)
 
 
 class RedactorError(RuntimeError):
@@ -107,6 +126,14 @@ contestar, un precio que no respondió.
 - Nunca te disculpes por insistir, ni digas "te escribo de nuevo", ni menciones que pasó tiempo.
 - Como máximo un emoji.
 
+## Tu objetivo es retomar el producto, no responder lo pendiente
+
+Si quedó una pregunta del cliente sin responder y vos no tenés el dato, NO la contestes ni
+ofrezcas averiguarla. No digas "te confirmo", "te averiguo", "te consigo" ni nada por el estilo:
+comprometerte a conseguir algo que no tenés es la peor forma de reabrir una charla. O lo pasás a
+un vendedor con la fórmula de siempre, o directamente retomás por el producto, que es lo que te
+interesa. Las dos son mejores que prometer.
+
 ## Lo que este mensaje NO puede hacer
 
 Ofrecer algo que después no vas a poder cumplir es peor que no escribir. En particular, NO
@@ -129,7 +156,31 @@ def build_redactor() -> Agent[None, Followup]:
     effort = settings.retargeting_reasoning_effort
     if effort and (settings.retargeting_model.startswith("gpt-5") or settings.retargeting_model.startswith("o")):
         model_settings = OpenAIChatModelSettings(openai_reasoning_effort=effort)
-    return Agent(model=model, output_type=Followup, system_prompt=system_prompt, model_settings=model_settings)
+    agent: Agent[None, Followup] = Agent(
+        model=model,
+        output_type=Followup,
+        system_prompt=system_prompt,
+        model_settings=model_settings,
+        retries=2,
+    )
+
+    @agent.output_validator
+    def _sin_promesas_imposibles(salida: Followup) -> Followup:
+        """Si prometió algo que FerrePro no hace, se lo devolvemos para que reescriba (ModelRetry
+        re-pregunta con el motivo). Solo si agota los reintentos falla la corrida."""
+        if not (salida.vale_la_pena and salida.mensaje):
+            return salida
+        encontrado = PROMESAS_PROHIBIDAS.search(salida.mensaje)
+        if encontrado and not DERIVA_A_VENDEDOR.search(salida.mensaje):
+            raise ModelRetry(
+                f"El mensaje dice '{encontrado.group(0)}' y eso es algo que FerrePro no puede "
+                "cumplir por WhatsApp. Reescribilo sin ofrecer reservas, traslados entre "
+                "sucursales ni datos que no tenés (origen, procedencia, fichas técnicas). "
+                "Si el cliente preguntó eso, ofrecé que lo vea un vendedor o retomá por el producto."
+            )
+        return salida
+
+    return agent
 
 
 def compose_followup(
