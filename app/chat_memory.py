@@ -223,7 +223,12 @@ def recent_history(conversation_id: int, limit: int = 16, exclude_ids: set[int] 
 
 # ── Outbox ──────────────────────────────────────────────────────────────────
 def create_outbox(
-    conversation_id: int, external_conversation_id: str, channel: str, content: str, idempotency_key: str
+    conversation_id: int,
+    external_conversation_id: str,
+    channel: str,
+    content: str,
+    idempotency_key: str,
+    raw_payload: dict | None = None,
 ) -> dict | None:
     # idempotency_key único: si ya existe (reintento del turno), PostgREST devuelve 409.
     # Lo tratamos como idempotente: devolvemos el outbox existente en vez de duplicar el envío.
@@ -236,6 +241,7 @@ def create_outbox(
                 "channel": channel,
                 "content": content,
                 "idempotency_key": idempotency_key,
+                "raw_payload": raw_payload or {},
             },
         )
     except supabase.SupabaseError as exc:

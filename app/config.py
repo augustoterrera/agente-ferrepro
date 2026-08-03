@@ -100,6 +100,13 @@ class Settings(BaseSettings):
     # Token del endpoint /admin/*. Sin token, el endpoint responde 404 (no existe).
     admin_token: str | None = None
 
+    # Meta / WhatsApp Cloud API + Catalogo. El catalogo lo alimenta Tienda Nube; el agente solo
+    # mapea producto Supabase/Tienda Nube -> variante/content_id para mandar productos nativos.
+    meta_access_token: str | None = None
+    meta_phone_number_id: str | None = None
+    meta_catalog_id: str | None = None
+    meta_graph_version: str = "v23.0"
+
     # Alertas por Telegram (opcional). Sin token/chat → no-op. Avisa en fallos finales de tasks
     # y excepciones no manejadas de la API.
     telegram_bot_token: str | None = None

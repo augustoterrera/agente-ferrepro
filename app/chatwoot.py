@@ -278,6 +278,16 @@ def chatwoot_contact_id(payload: dict[str, Any]) -> str | None:
     return str(value) if value is not None else None
 
 
+def chatwoot_contact_phone(payload: dict[str, Any]) -> str | None:
+    sender = payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
+    contact = payload.get("contact") if isinstance(payload.get("contact"), dict) else {}
+    value = sender.get("phone_number") or contact.get("phone_number")
+    if value is None:
+        return None
+    phone = "".join(ch for ch in str(value) if ch.isdigit())
+    return phone or None
+
+
 def should_handoff_to_agent(content: str) -> bool:
     text = content.lower()
     # ponytail: el prompt usa esta frase para derivaciones reales; si agregan nuevas plantillas,

@@ -60,6 +60,7 @@ def health() -> dict[str, object]:
         "has_openai": bool(settings.openai_api_key),
         "has_chatwoot": bool(settings.chatwoot_url and settings.chatwoot_access_token),
         "has_webhook_secret": bool(settings.chatwoot_webhook_secret),
+        "has_meta": bool(settings.meta_access_token and settings.meta_phone_number_id and settings.meta_catalog_id),
     }
 
 

@@ -40,8 +40,16 @@ class AgentError(RuntimeError):
 class Deps:
     # Links de productos realmente devueltos por las tools este turno → set permitido del guard.
     shown_links: set[str] = field(default_factory=set)
+    # Link → id de producto Tienda Nube/Supabase. Se usa después para mandar catálogo nativo.
+    product_ids_by_link: dict[str, int] = field(default_factory=dict)
     # Links ya mostrados en turnos previos: no se vuelven a ofrecer salvo pedido explícito.
     seen_links: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class AgentReply:
+    text: str
+    product_ids: list[int]
 
 
 def build_agent() -> Agent[Deps, str]:
@@ -68,7 +76,9 @@ def build_agent() -> Agent[Deps, str]:
             productos = [p for p in productos if _norm_url(p.canonical_url) not in ctx.deps.seen_links][:limite]
         for p in productos:
             if p.canonical_url:
-                ctx.deps.shown_links.add(_norm_url(p.canonical_url))
+                link = _norm_url(p.canonical_url)
+                ctx.deps.shown_links.add(link)
+                ctx.deps.product_ids_by_link[link] = p.id
         return compact_for_llm(productos)
 
     @agent.tool
@@ -111,11 +121,19 @@ def run_agent(
     history: list[AgentMessage] | None = None,
     images: list[tuple[bytes, str]] | None = None,
 ) -> str:
+    return run_agent_reply(message, history, images).text
+
+
+def run_agent_reply(
+    message: str,
+    history: list[AgentMessage] | None = None,
+    images: list[tuple[bytes, str]] | None = None,
+) -> AgentReply:
     """`images`: lista de (bytes, media_type) para que el modelo multimodal las vea."""
     history = history or []
     scoped_reply = scope_reply(decide_scope(message, history))
     if scoped_reply:
-        return scoped_reply
+        return AgentReply(scoped_reply, [])
     agent = build_agent()
     deps = Deps(seen_links=set() if _asks_to_repeat(message) else _history_product_links(history))
     text = _build_input(message, history)
@@ -126,7 +144,8 @@ def run_agent(
         result = agent.run_sync(prompt, deps=deps)
     except Exception as exc:
         raise AgentError(f"Falló la corrida del agente: {exc}") from exc
-    return guard_links(result.output, deps.shown_links | FIXED_LINKS)
+    answer = guard_links(result.output, deps.shown_links | FIXED_LINKS)
+    return AgentReply(answer, _answer_product_ids(answer, deps.product_ids_by_link))
 
 
 def _build_input(message: str, history: list[AgentMessage]) -> str:
@@ -155,6 +174,17 @@ def _history_product_links(history: list[AgentMessage]) -> set[str]:
     return urls
 
 
+def _answer_product_ids(answer: str, product_ids_by_link: dict[str, int]) -> list[int]:
+    ids: list[int] = []
+    seen: set[int] = set()
+    for url in _URL_RE.findall(answer):
+        product_id = product_ids_by_link.get(_norm_url(url))
+        if product_id is not None and product_id not in seen:
+            ids.append(product_id)
+            seen.add(product_id)
+    return ids[:30]
+
+
 def _asks_to_repeat(message: str) -> bool:
     text = message.lower()
     return "link" in text or "de nuevo" in text or "otra vez" in text or "repet" in text
@@ -181,6 +211,7 @@ if __name__ == "__main__":
     assert _history_product_links([AgentMessage(role="assistant", content=f"🔗 {PRODUCT_URL_PREFIX}x/")]) == {
         f"{PRODUCT_URL_PREFIX}x"
     }
+    assert _answer_product_ids(f"🔗 {PRODUCT_URL_PREFIX}x/", {f"{PRODUCT_URL_PREFIX}x": 10}) == [10]
     assert _asks_to_repeat("pasame el link de nuevo")
     assert "no vendemos celulares" in run_agent("Y los celulares cuánto está")
     assert "no vendemos celulares" in run_agent("Motorola e14")

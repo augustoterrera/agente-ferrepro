@@ -6,7 +6,8 @@ from unittest.mock import patch
 
 from app import chat_memory, retargeting
 from app.chat_memory import Conversation
-from app.chatwoot import ChatwootClient
+from app.agent import _answer_product_ids
+from app.chatwoot import ChatwootClient, chatwoot_contact_phone
 from app.tasks import chatwoot_tasks as tasks
 
 
@@ -136,6 +137,41 @@ class RetargetingChecks(unittest.TestCase):
         self.assertEqual(conversation.id, 7)
         self.assertEqual(job_id, 9)
         self.assertEqual(rpc.call_args.args[0], "chat_persist_incoming_event")
+
+    def test_extrae_ids_de_productos_mostrados(self) -> None:
+        self.assertEqual(
+            _answer_product_ids(
+                "Mirá\n🔗 https://www.ferreproindustrial.com/productos/taladro/",
+                {"https://www.ferreproindustrial.com/productos/taladro": 350971067},
+            ),
+            [350971067],
+        )
+
+    def test_telefono_chatwoot_sirve_para_meta(self) -> None:
+        self.assertEqual(
+            chatwoot_contact_phone({"sender": {"phone_number": "+54 9 381 555-1234"}}),
+            "5493815551234",
+        )
+
+    def test_envio_catalogo_usa_content_id_de_variante(self) -> None:
+        outbox = {"raw_payload": {"customer_phone": "5493815551234", "meta_product_product_ids": [350971067]}}
+        sent: list[dict] = []
+
+        def _send(payload):
+            sent.append(payload)
+            return {"messages": [{"id": "wamid.test"}]}
+
+        with (
+            patch.object(tasks.settings, "meta_access_token", "token"),
+            patch.object(tasks.settings, "meta_phone_number_id", "phone-id"),
+            patch.object(tasks.settings, "meta_catalog_id", "catalog-id"),
+            patch.object(tasks, "product_retailer_ids", return_value=["1544613986"]),
+            patch.object(tasks, "send_whatsapp", side_effect=_send),
+        ):
+            response = tasks._send_meta_products_if_any(outbox)
+
+        self.assertEqual(response, {"messages": [{"id": "wamid.test"}]})
+        self.assertEqual(sent[0]["interactive"]["action"]["product_retailer_id"], "1544613986")
 
 
 if __name__ == "__main__":

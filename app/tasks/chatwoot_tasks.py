@@ -15,6 +15,13 @@ from app.chatwoot import ChatwootError, build_chatwoot_client, detect_handoff_fl
 from app.chatwoot_service import process_pending_conversation_messages, sync_crm_labels
 from app.classifier import STAGE_LABELS, classify
 from app.config import settings
+from app.meta import (
+    MetaError,
+    product_list_payload,
+    product_retailer_ids,
+    send_whatsapp,
+    single_product_payload,
+)
 from app.search import SearchError
 from app.supabase import SupabaseError
 
@@ -224,7 +231,8 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
         )
         if already_delivered:
             logger.info("outbox_ya_estaba_en_chatwoot", extra={"outbox_id": outbox_id})
-            chat_memory.mark_outbox_sent(int(outbox_id), {"deduplicado": True})
+            meta_response = _send_meta_products_if_any(outbox)
+            chat_memory.mark_outbox_sent(int(outbox_id), {"chatwoot": {"deduplicado": True}, "meta": meta_response})
         else:
             # La cola pudo demorarse y el cliente contestar antes del POST. La RPC serializa este
             # chequeo contra el intake; si retomó, el follow-up pendiente se cancela.
@@ -234,7 +242,8 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
             response = client.create_outgoing_message(
                 account_id, outbox["external_conversation_id"], outbox["content"]
             )
-            chat_memory.mark_outbox_sent(int(outbox_id), response)
+            meta_response = _send_meta_products_if_any(outbox)
+            chat_memory.mark_outbox_sent(int(outbox_id), {"chatwoot": response, "meta": meta_response})
     except Exception as exc:
         status = chat_memory.mark_outbox_retry_or_failed(int(outbox_id), str(exc))
         if status in {"sent", "cancelled"}:
@@ -254,6 +263,27 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
         raise self.retry(exc=exc)
     handoff = _handoff_if_needed(client, account_id, conv, outbox["content"])
     return {"ok": True, "outbox_id": outbox_id, "status": "sent", "handoff": handoff}
+
+
+def _send_meta_products_if_any(outbox: dict) -> dict[str, object] | None:
+    raw = outbox.get("raw_payload") if isinstance(outbox.get("raw_payload"), dict) else {}
+    phone = raw.get("customer_phone")
+    product_ids = [int(pid) for pid in raw.get("meta_product_product_ids") or [] if str(pid).isdigit()]
+    if not (phone and product_ids and settings.meta_access_token and settings.meta_phone_number_id and settings.meta_catalog_id):
+        return None
+    try:
+        retailer_ids = product_retailer_ids(product_ids)
+        if not retailer_ids:
+            return None
+        payload = (
+            product_list_payload(phone, retailer_ids, body="Te dejo los productos para verlos en WhatsApp")
+            if len(retailer_ids) > 1
+            else single_product_payload(phone, retailer_ids[0], body="Te dejo el producto para verlo en WhatsApp")
+        )
+        return send_whatsapp(payload)
+    except (SupabaseError, MetaError) as exc:
+        logger.warning("meta_catalog_message_failed", extra={"outbox_id": outbox.get("id"), "error": str(exc)})
+        return {"error": str(exc)[:500]}
 
 
 @celery_app.task(name="app.tasks.chatwoot_tasks.classify_and_label_conversation", queue="chatwoot_outbound")
