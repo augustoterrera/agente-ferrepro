@@ -6,8 +6,9 @@ from unittest.mock import patch
 
 from app import chat_memory, retargeting
 from app.chat_memory import Conversation
-from app.agent import _answer_product_ids
+from app.agent import _answer_product_ids, _filter_requested_product_type
 from app.chatwoot import ChatwootClient, chatwoot_contact_phone
+from app.models import Product
 from app.tasks import chatwoot_tasks as tasks
 
 
@@ -145,6 +146,16 @@ class RetargetingChecks(unittest.TestCase):
                 {"https://www.ferreproindustrial.com/productos/taladro": 350971067},
             ),
             [350971067],
+        )
+
+    def test_zorra_no_devuelve_apiladores(self) -> None:
+        products = [
+            Product(id=1, name="ZORRA HIDRAULICA 3TN"),
+            Product(id=2, name="APILADOR HIDRAULICO 3TN X 1.6MTS"),
+        ]
+        self.assertEqual(
+            [p.id for p in _filter_requested_product_type(products, "quiero la zorra hidraulica de 500.000")],
+            [1],
         )
 
     def test_telefono_chatwoot_sirve_para_meta(self) -> None:

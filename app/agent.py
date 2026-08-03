@@ -11,7 +11,7 @@ from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from .config import settings
-from .models import AgentMessage
+from .models import AgentMessage, Product
 from .search import buscar_productos as _buscar, compact_for_llm
 from .scope import decide_scope, scope_reply
 from .supabase import select as sb_select
@@ -38,6 +38,7 @@ class AgentError(RuntimeError):
 
 @dataclass
 class Deps:
+    current_message: str = ""
     # Links de productos realmente devueltos por las tools este turno → set permitido del guard.
     shown_links: set[str] = field(default_factory=set)
     # Link → id de producto Tienda Nube/Supabase. Se usa después para mandar catálogo nativo.
@@ -72,6 +73,7 @@ def build_agent() -> Agent[Deps, str]:
         si un producto existe aunque esté sin stock (devuelve en_stock por ítem)."""
         search_limit = limite + len(ctx.deps.seen_links) if ctx.deps.seen_links and not incluir_sin_stock else limite
         productos = _buscar(consulta, limite=search_limit, solo_con_stock=not incluir_sin_stock)
+        productos = _filter_requested_product_type(productos, ctx.deps.current_message)
         if ctx.deps.seen_links and not incluir_sin_stock:
             productos = [p for p in productos if _norm_url(p.canonical_url) not in ctx.deps.seen_links][:limite]
         for p in productos:
@@ -135,7 +137,10 @@ def run_agent_reply(
     if scoped_reply:
         return AgentReply(scoped_reply, [])
     agent = build_agent()
-    deps = Deps(seen_links=set() if _asks_to_repeat(message) else _history_product_links(history))
+    deps = Deps(
+        current_message=message,
+        seen_links=set() if _asks_to_repeat(message) else _history_product_links(history),
+    )
     text = _build_input(message, history)
     prompt: object = text
     if images:
@@ -158,6 +163,17 @@ def _build_input(message: str, history: list[AgentMessage]) -> str:
 
 
 _URL_RE = re.compile(r"https?://\S+")
+_PRODUCT_TYPE_PATTERNS = (
+    re.compile(r"\b(?:zorras?|transpaletas?)\b", re.IGNORECASE),
+    re.compile(r"\bapiladoras?\b", re.IGNORECASE),
+)
+
+
+def _filter_requested_product_type(products: list[Product], request: str) -> list[Product]:
+    requested = [pattern for pattern in _PRODUCT_TYPE_PATTERNS if pattern.search(request)]
+    if not requested:
+        return products
+    return [product for product in products if any(pattern.search(product.name) for pattern in requested)]
 
 
 def _norm_url(url: str | None) -> str:

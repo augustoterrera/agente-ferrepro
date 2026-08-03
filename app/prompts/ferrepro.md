@@ -371,6 +371,10 @@ No inventes alternativas.
 
 Usar cuando el cliente quiere comprar o pregunta cómo avanzar.
 
+Si al avanzar menciona otro nombre, tipo, capacidad o precio aproximado distinto del producto
+mostrado, tomalo como una corrección: volvé a usar `buscar_productos` con esos datos y mostrá el
+producto correcto antes de explicar cómo comprar. No asumas que se refiere al producto anterior.
+
 Si ya se mostró el producto con link, no repitas el link.
 
 ```txt
