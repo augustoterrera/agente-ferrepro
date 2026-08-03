@@ -18,6 +18,13 @@ class ChatwootError(RuntimeError):
     pass
 
 
+CATALOG_PRIVATE_NOTE_FOOTER = "Muestra de lo enviado al cliente mediante el catálogo de WhatsApp."
+
+
+def catalog_private_note(content: str) -> str:
+    return f"{content.rstrip()}\n\n---\n{CATALOG_PRIVATE_NOTE_FOOTER}"
+
+
 @dataclass(frozen=True)
 class ChatwootMessageEvent:
     event: str
@@ -34,12 +41,19 @@ class ChatwootClient:
     access_token: str
     timeout_seconds: int = 30
 
-    def create_outgoing_message(self, account_id: int | str, conversation_id: int | str, content: str) -> dict[str, Any]:
+    def create_outgoing_message(
+        self,
+        account_id: int | str,
+        conversation_id: int | str,
+        content: str,
+        *,
+        private: bool = False,
+    ) -> dict[str, Any]:
         endpoint = (
             f"{self.base_url.rstrip('/')}/api/v1/accounts/{account_id}"
             f"/conversations/{conversation_id}/messages"
         )
-        body = {"content": content, "message_type": "outgoing", "private": False, "content_type": "text"}
+        body = {"content": content, "message_type": "outgoing", "private": private, "content_type": "text"}
         return self._request("POST", endpoint, body)
 
     def has_outgoing_message(
@@ -72,7 +86,7 @@ class ChatwootClient:
             return False
         return any(
             _role(m) == "assistant"
-            and str(m.get("content") or "").strip() == objetivo
+            and str(m.get("content") or "").strip() in {objetivo, catalog_private_note(objetivo)}
             and (creado := _epoch(m.get("created_at"))) is not None
             and creado >= desde - 5
             for m in payload

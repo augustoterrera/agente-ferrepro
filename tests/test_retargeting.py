@@ -109,6 +109,23 @@ class RetargetingChecks(unittest.TestCase):
                     created_after="2026-08-04T09:00:00Z",
                 )
             )
+            payload["payload"][1].update(
+                {
+                    "content": (
+                        "¿Seguís interesado en el taladro?\n\n---\n"
+                        "Muestra de lo enviado al cliente mediante el catálogo de WhatsApp."
+                    ),
+                    "private": True,
+                }
+            )
+            self.assertTrue(
+                client.has_outgoing_message(
+                    1,
+                    2,
+                    "¿Seguís interesado en el taladro?",
+                    created_after="2026-08-04T09:00:00Z",
+                )
+            )
 
     def test_intake_atomico_devuelve_conversacion_y_job(self) -> None:
         response = {
@@ -183,6 +200,74 @@ class RetargetingChecks(unittest.TestCase):
 
         self.assertEqual(response, {"messages": [{"id": "wamid.test"}]})
         self.assertEqual(sent[0]["interactive"]["action"]["product_retailer_id"], "1544613986")
+
+    def test_catalogo_exitoso_solo_deja_nota_privada_en_chatwoot(self) -> None:
+        outbox = {
+            "id": 1, "conversation_id": 5, "external_conversation_id": "8", "status": "pending",
+            "content": "Zorra con precio y link", "attempts": 0, "idempotency_key": "chatwoot:8:x",
+            "created_at": "2026-08-04T09:00:00+00:00",
+        }
+        posts: list[tuple[str, bool]] = []
+
+        class _Client:
+            def create_outgoing_message(self, _a, _c, content, *, private=False):
+                posts.append((content, private))
+                return {"id": 10, "private": private}
+
+        with (
+            patch.object(tasks.chat_memory, "get_outbox", return_value=outbox),
+            patch.object(tasks.chat_memory, "mark_outbox_processing", return_value=True),
+            patch.object(tasks.chat_memory, "get_conversation", return_value=Conversation(5, "chatwoot", "8", "6")),
+            patch.object(tasks.chat_memory, "mark_outbox_sent") as marked,
+            patch.object(tasks, "build_chatwoot_client", return_value=_Client()),
+            patch.object(tasks, "_send_meta_products_if_any", return_value={"messages": [{"id": "wamid.test"}]}),
+            patch.object(tasks, "_handoff_if_needed", return_value=False),
+        ):
+            tasks.send_chatwoot_outbound_message("1")
+
+        self.assertEqual(
+            posts,
+            [
+                (
+                    "Zorra con precio y link\n\n---\n"
+                    "Muestra de lo enviado al cliente mediante el catálogo de WhatsApp.",
+                    True,
+                )
+            ],
+        )
+        self.assertEqual(
+            marked.call_args.args[1],
+            {
+                "meta": {"messages": [{"id": "wamid.test"}]},
+                "chatwoot_private": {"id": 10, "private": True},
+            },
+        )
+
+    def test_catalogo_rechazado_conserva_texto_chatwoot(self) -> None:
+        outbox = {
+            "id": 1, "conversation_id": 5, "external_conversation_id": "8", "status": "pending",
+            "content": "Producto con precio y link", "attempts": 0, "idempotency_key": "chatwoot:8:x",
+            "created_at": "2026-08-04T09:00:00+00:00",
+        }
+        posts: list[str] = []
+
+        class _Client:
+            def create_outgoing_message(self, _a, _c, content):
+                posts.append(content)
+                return {"id": 10}
+
+        with (
+            patch.object(tasks.chat_memory, "get_outbox", return_value=outbox),
+            patch.object(tasks.chat_memory, "mark_outbox_processing", return_value=True),
+            patch.object(tasks.chat_memory, "get_conversation", return_value=Conversation(5, "chatwoot", "8", "6")),
+            patch.object(tasks.chat_memory, "mark_outbox_sent"),
+            patch.object(tasks, "build_chatwoot_client", return_value=_Client()),
+            patch.object(tasks, "_send_meta_products_if_any", return_value={"error": "no aprobado"}),
+            patch.object(tasks, "_handoff_if_needed", return_value=False),
+        ):
+            tasks.send_chatwoot_outbound_message("1")
+
+        self.assertEqual(posts, ["Producto con precio y link"])
 
 
 if __name__ == "__main__":

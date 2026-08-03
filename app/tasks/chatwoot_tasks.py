@@ -11,7 +11,13 @@ import redis
 
 from app import chat_memory, notifier, retargeting
 from app.celery_app import celery_app
-from app.chatwoot import ChatwootError, build_chatwoot_client, detect_handoff_flags, should_handoff_to_agent
+from app.chatwoot import (
+    ChatwootError,
+    build_chatwoot_client,
+    catalog_private_note,
+    detect_handoff_flags,
+    should_handoff_to_agent,
+)
 from app.chatwoot_service import process_pending_conversation_messages, sync_crm_labels
 from app.classifier import STAGE_LABELS, classify
 from app.config import settings
@@ -231,19 +237,31 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
         )
         if already_delivered:
             logger.info("outbox_ya_estaba_en_chatwoot", extra={"outbox_id": outbox_id})
-            meta_response = _send_meta_products_if_any(outbox)
-            chat_memory.mark_outbox_sent(int(outbox_id), {"chatwoot": {"deduplicado": True}, "meta": meta_response})
+            chat_memory.mark_outbox_sent(int(outbox_id), {"chatwoot": {"deduplicado": True}})
         else:
             # La cola pudo demorarse y el cliente contestar antes del POST. La RPC serializa este
             # chequeo contra el intake; si retomó, el follow-up pendiente se cancela.
             if is_retargeting and chat_memory.cancel_retargeting_if_resumed(int(outbox_id)):
                 logger.info("retargeting_cancelado_por_respuesta", extra={"outbox_id": outbox_id})
                 return {"ok": True, "outbox_id": outbox_id, "status": "cancelled"}
-            response = client.create_outgoing_message(
-                account_id, outbox["external_conversation_id"], outbox["content"]
-            )
             meta_response = _send_meta_products_if_any(outbox)
-            chat_memory.mark_outbox_sent(int(outbox_id), {"chatwoot": response, "meta": meta_response})
+            if meta_response is not None and "error" not in meta_response:
+                try:
+                    note = client.create_outgoing_message(
+                        account_id,
+                        outbox["external_conversation_id"],
+                        catalog_private_note(outbox["content"]),
+                        private=True,
+                    )
+                except ChatwootError as exc:
+                    logger.warning("meta_catalog_private_note_failed", extra={"outbox_id": outbox_id, "error": str(exc)})
+                    note = {"error": str(exc)[:500]}
+                chat_memory.mark_outbox_sent(int(outbox_id), {"meta": meta_response, "chatwoot_private": note})
+            else:
+                response = client.create_outgoing_message(
+                    account_id, outbox["external_conversation_id"], outbox["content"]
+                )
+                chat_memory.mark_outbox_sent(int(outbox_id), {"chatwoot": response, "meta": meta_response})
     except Exception as exc:
         status = chat_memory.mark_outbox_retry_or_failed(int(outbox_id), str(exc))
         if status in {"sent", "cancelled"}:
