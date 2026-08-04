@@ -23,8 +23,9 @@ from app.classifier import STAGE_LABELS, classify
 from app.config import settings
 from app.meta import (
     MetaError,
+    available_catalog_retailer_ids,
     product_list_payload,
-    product_retailer_ids,
+    product_retailer_ids_by_product,
     send_whatsapp,
     single_product_payload,
 )
@@ -172,12 +173,15 @@ def process_chatwoot_conversation(self, conversation_id: str) -> dict[str, objec
             # El gate bot_apagado se aplica en el webhook (labels vienen en el payload), así que
             # si llegamos acá es porque el bot está habilitado para esta conversación.
             chat_memory.update_jobs(conv.channel, conv.external_conversation_id, "processing", worker_id=worker_id(task_id))
-            outbox_id = process_pending_conversation_messages(int(conversation_id))
-            if outbox_id is not None:
+            processed = process_pending_conversation_messages(int(conversation_id))
+            outbox_id = processed[0] if processed else None
+            if processed is not None:
+                outbox_id, should_classify = processed
                 send_chatwoot_outbound_message.apply_async((str(outbox_id),), queue="chatwoot_outbound")
                 # Clasificar y etiquetar la conversación (async, no frena el reply). Corre también
                 # en handoff para no perder etapa/flags si la derivación apaga el bot.
-                classify_and_label_conversation.apply_async((str(conversation_id),), queue="chatwoot_outbound")
+                if should_classify:
+                    classify_and_label_conversation.apply_async((str(conversation_id),), queue="chatwoot_outbound")
             return {"ok": True, "conversation_id": conversation_id, "outbox_id": outbox_id}
         except Exception as exc:
             status = "failed" if self.request.retries >= settings.chatwoot_job_max_retries else "retry"
@@ -224,6 +228,7 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
 
     try:
         is_retargeting = str(outbox.get("idempotency_key") or "").startswith("retargeting:")
+        meta_plan = _meta_product_plan(outbox)
         # Entrega dudosa: ya hubo intentos, o el claim anterior quedó colgado en processing. En
         # los dos casos el POST pudo haber llegado y haberse perdido solo la confirmación.
         # Aplica a TODO el outbound, no solo al retargeting: recibir dos veces la misma respuesta
@@ -234,6 +239,7 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
             outbox["external_conversation_id"],
             outbox["content"],
             created_after=str(outbox.get("created_at") or ""),
+            private=False,
         )
         if already_delivered:
             logger.info("outbox_ya_estaba_en_chatwoot", extra={"outbox_id": outbox_id})
@@ -244,24 +250,70 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
             if is_retargeting and chat_memory.cancel_retargeting_if_resumed(int(outbox_id)):
                 logger.info("retargeting_cancelado_por_respuesta", extra={"outbox_id": outbox_id})
                 return {"ok": True, "outbox_id": outbox_id, "status": "cancelled"}
-            meta_response = _send_meta_products_if_any(outbox)
-            if meta_response is not None and "error" not in meta_response:
+            meta_response = None
+            catalog_already_delivered = False
+            remaining_already_delivered = False
+            if uncertain_delivery and meta_plan is not None and "error" not in meta_plan:
+                catalog_already_delivered = client.has_outgoing_message(
+                    account_id,
+                    outbox["external_conversation_id"],
+                    str(meta_plan["catalog_text"]),
+                    created_after=str(outbox.get("created_at") or ""),
+                    private=True,
+                )
+                remaining_text = meta_plan.get("remaining_text")
+                remaining_already_delivered = not remaining_text or client.has_outgoing_message(
+                    account_id,
+                    outbox["external_conversation_id"],
+                    str(remaining_text),
+                    created_after=str(outbox.get("created_at") or ""),
+                    private=False,
+                )
+
+            if meta_plan is not None and "error" not in meta_plan:
+                if catalog_already_delivered:
+                    meta_response = {"deduplicado": True}
+                else:
+                    meta_response = _send_meta_product_plan(meta_plan, outbox.get("id"))
+
+            if meta_response is not None and "error" not in meta_response and meta_plan is not None:
                 try:
-                    note = client.create_outgoing_message(
-                        account_id,
-                        outbox["external_conversation_id"],
-                        catalog_private_note(outbox["content"]),
-                        private=True,
+                    note = (
+                        {"deduplicado": True}
+                        if catalog_already_delivered
+                        else client.create_outgoing_message(
+                            account_id,
+                            outbox["external_conversation_id"],
+                            catalog_private_note(str(meta_plan["catalog_text"])),
+                            private=True,
+                        )
                     )
                 except ChatwootError as exc:
                     logger.warning("meta_catalog_private_note_failed", extra={"outbox_id": outbox_id, "error": str(exc)})
                     note = {"error": str(exc)[:500]}
-                chat_memory.mark_outbox_sent(int(outbox_id), {"meta": meta_response, "chatwoot_private": note})
+                remaining_response = None
+                if meta_plan.get("remaining_text") and not remaining_already_delivered:
+                    remaining_response = client.create_outgoing_message(
+                        account_id,
+                        outbox["external_conversation_id"],
+                        str(meta_plan["remaining_text"]),
+                    )
+                chat_memory.mark_outbox_sent(
+                    int(outbox_id),
+                    {
+                        "meta": {
+                            "response": meta_response,
+                            "product_ids": meta_plan["catalog_product_ids"],
+                        },
+                        "chatwoot_private": note,
+                        "chatwoot_remaining": remaining_response,
+                    },
+                )
             else:
                 response = client.create_outgoing_message(
                     account_id, outbox["external_conversation_id"], outbox["content"]
                 )
-                chat_memory.mark_outbox_sent(int(outbox_id), {"chatwoot": response, "meta": meta_response})
+                chat_memory.mark_outbox_sent(int(outbox_id), {"chatwoot": response, "meta": meta_plan})
     except Exception as exc:
         status = chat_memory.mark_outbox_retry_or_failed(int(outbox_id), str(exc))
         if status in {"sent", "cancelled"}:
@@ -283,25 +335,97 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
     return {"ok": True, "outbox_id": outbox_id, "status": "sent", "handoff": handoff}
 
 
-def _send_meta_products_if_any(outbox: dict) -> dict[str, object] | None:
+def _meta_product_plan(outbox: dict) -> dict[str, object] | None:
     raw = outbox.get("raw_payload") if isinstance(outbox.get("raw_payload"), dict) else {}
     phone = raw.get("customer_phone")
-    product_ids = [int(pid) for pid in raw.get("meta_product_product_ids") or [] if str(pid).isdigit()]
+    product_ids = list(
+        dict.fromkeys(int(pid) for pid in raw.get("meta_product_product_ids") or [] if str(pid).isdigit())
+    )[:5]
     if not (phone and product_ids and settings.meta_access_token and settings.meta_phone_number_id and settings.meta_catalog_id):
         return None
     try:
-        retailer_ids = product_retailer_ids(product_ids)
-        if not retailer_ids:
+        retailer_by_product = product_retailer_ids_by_product(product_ids)
+        available_retailer_ids = available_catalog_retailer_ids(list(retailer_by_product.values()))
+        catalog_product_ids = [
+            product_id
+            for product_id in product_ids
+            if retailer_by_product.get(product_id) in available_retailer_ids
+        ]
+        if not catalog_product_ids:
             return None
+        remaining_product_ids = [product_id for product_id in product_ids if product_id not in catalog_product_ids]
+        catalog_text = str(outbox["content"])
+        remaining_text = None
+        if remaining_product_ids:
+            product_urls = {
+                int(product_id): str(url)
+                for product_id, url in (raw.get("meta_product_urls") or {}).items()
+                if str(product_id).isdigit() and url
+            }
+            split = _split_catalog_content(
+                str(outbox["content"]), product_ids, product_urls, set(catalog_product_ids)
+            )
+            if split is None:
+                return None
+            catalog_text, remaining_text = split
+        retailer_ids = [retailer_by_product[product_id] for product_id in catalog_product_ids]
         payload = (
             product_list_payload(phone, retailer_ids, body="Te dejo los productos para verlos en WhatsApp")
             if len(retailer_ids) > 1
             else single_product_payload(phone, retailer_ids[0], body="Te dejo el producto para verlo en WhatsApp")
         )
-        return send_whatsapp(payload)
+        return {
+            "payload": payload,
+            "catalog_product_ids": catalog_product_ids,
+            "catalog_text": catalog_text,
+            "remaining_text": remaining_text,
+        }
     except (SupabaseError, MetaError) as exc:
-        logger.warning("meta_catalog_message_failed", extra={"outbox_id": outbox.get("id"), "error": str(exc)})
+        logger.warning("meta_catalog_plan_failed", extra={"outbox_id": outbox.get("id"), "error": str(exc)})
         return {"error": str(exc)[:500]}
+
+
+def _send_meta_product_plan(plan: dict[str, object], outbox_id: object = None) -> dict[str, object]:
+    try:
+        return send_whatsapp(plan["payload"])
+    except MetaError as exc:
+        logger.warning("meta_catalog_message_failed", extra={"outbox_id": outbox_id, "error": str(exc)})
+        return {"error": str(exc)[:500]}
+
+
+def _split_catalog_content(
+    content: str,
+    product_ids: list[int],
+    product_urls: dict[int, str],
+    catalog_product_ids: set[int],
+) -> tuple[str, str] | None:
+    remaining_product_ids = set(product_ids) - catalog_product_ids
+    if not remaining_product_ids:
+        return content, ""
+    if any(product_id not in product_urls for product_id in product_ids):
+        return None
+
+    blocks = content.split("\n\n")
+    block_products = [
+        {product_id for product_id in product_ids if product_urls[product_id].rstrip("/") in block}
+        for block in blocks
+    ]
+    if set().union(*block_products) != set(product_ids):
+        return None
+    if any(ids & catalog_product_ids and ids & remaining_product_ids for ids in block_products):
+        return None
+
+    catalog_text = "\n\n".join(
+        block for block, ids in zip(blocks, block_products) if not ids or ids <= catalog_product_ids
+    ).strip()
+    first_remaining = next(i for i, ids in enumerate(block_products) if ids & remaining_product_ids)
+    remaining_blocks = [
+        block
+        for i, (block, ids) in enumerate(zip(blocks, block_products))
+        if i >= first_remaining and (not ids or ids <= remaining_product_ids)
+    ]
+    remaining_text = "\n\n".join(["También tenemos estas opciones 👇", *remaining_blocks]).strip()
+    return catalog_text, remaining_text
 
 
 @celery_app.task(name="app.tasks.chatwoot_tasks.classify_and_label_conversation", queue="chatwoot_outbound")

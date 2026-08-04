@@ -63,6 +63,7 @@ class ChatwootClient:
         content: str,
         *,
         created_after: str,
+        private: bool | None = None,
     ) -> bool:
         """¿Ya salió este texto en esta conversación después de `created_after`?
 
@@ -84,9 +85,13 @@ class ChatwootClient:
         desde = _epoch(created_after)
         if desde is None:
             return False
+        expected_contents = {objetivo}
+        if private is not False:
+            expected_contents.add(catalog_private_note(objetivo))
         return any(
             _role(m) == "assistant"
-            and str(m.get("content") or "").strip() in {objetivo, catalog_private_note(objetivo)}
+            and str(m.get("content") or "").strip() in expected_contents
+            and (private is None or bool(m.get("private")) is private)
             and (creado := _epoch(m.get("created_at"))) is not None
             and creado >= desde - 5
             for m in payload

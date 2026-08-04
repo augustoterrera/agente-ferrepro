@@ -18,6 +18,8 @@ from .config import settings
 
 logger = logging.getLogger(__name__)
 HANDOFF_ACCEPTED_REPLY = "Perfecto, te derivo con un vendedor de FerrePro para coordinarlo."
+RESET_REPLY = "Listo, borré la memoria de esta conversación. Tu próximo mensaje empieza desde cero."
+RESET_DENIED_REPLY = "Este comando no está habilitado para esta conversación."
 
 
 def chatwoot_event_key(headers: dict[str, str | None], conversation_id: int | str, message_id: int | str | None) -> str:
@@ -103,9 +105,9 @@ def persist_incoming_chatwoot_event(
     return is_new, conversation, job_id
 
 
-def process_pending_conversation_messages(conversation_id: int) -> int | None:
+def process_pending_conversation_messages(conversation_id: int) -> tuple[int, bool] | None:
     """Junta los mensajes pending del cliente, corre el agente y deja la respuesta en el outbox.
-    Devuelve el id del outbox a enviar, o None si no hubo nada que responder."""
+    Devuelve (outbox_id, clasificar), o None si no hubo nada que responder."""
     conv = chat_memory.get_conversation(conversation_id)
     pending = chat_memory.pending_messages(conversation_id)
     if not pending:
@@ -127,7 +129,26 @@ def process_pending_conversation_messages(conversation_id: int) -> int | None:
 
     history = chat_memory.recent_history(conversation_id, settings.chatwoot_history_limit, exclude_ids=set(message_ids))
 
-    if not images and is_handoff_acceptance(user_content, history):
+    reset_requested = not images and user_content.strip().lower() == "/reset"
+    if reset_requested and _reset_authorized(conv, pending[-1].get("raw_payload") or {}):
+        chat_memory.clear_conversation_history(conversation_id)
+        outbox = chat_memory.create_outbox(
+            conversation_id,
+            conv.external_conversation_id,
+            conv.channel,
+            RESET_REPLY,
+            outbox_idempotency_key(conv.external_conversation_id, message_ids, RESET_REPLY),
+            raw_payload={"memory_reset": True},
+        )
+        if outbox is None:
+            raise supabase.SupabaseError("No se pudo crear la confirmación del reset")
+        chat_memory.hide_messages_from_history(message_ids)
+        chat_memory.update_jobs(conv.channel, conv.external_conversation_id, "completed")
+        chat_memory.update_events(conv.channel, conv.external_conversation_id, "completed")
+        return int(outbox["id"]), False
+    if reset_requested:
+        reply = AgentReply(RESET_DENIED_REPLY, [])
+    elif not images and is_handoff_acceptance(user_content, history):
         reply = AgentReply(HANDOFF_ACCEPTED_REPLY, [])
     else:
         # Si el agente falla, propagamos: el estado retry/failed del job lo decide la task de
@@ -158,12 +179,23 @@ def process_pending_conversation_messages(conversation_id: int) -> int | None:
         outbox_idempotency_key(conv.external_conversation_id, message_ids, answer),
         raw_payload={
             "meta_product_product_ids": reply.product_ids,
+            "meta_product_urls": reply.product_urls,
             "customer_phone": chatwoot_contact_phone(pending[-1].get("raw_payload") or {}),
         },
     )
     chat_memory.update_jobs(conv.channel, conv.external_conversation_id, "completed")
     chat_memory.update_events(conv.channel, conv.external_conversation_id, "completed")
-    return outbox["id"] if outbox else None
+    return (int(outbox["id"]), True) if outbox else None
+
+
+def _reset_authorized(conv: chat_memory.Conversation, payload: dict[str, Any]) -> bool:
+    configured_phone = "".join(ch for ch in str(settings.chat_reset_phone or "") if ch.isdigit())
+    return bool(
+        configured_phone
+        and settings.chat_reset_conversation_id
+        and chatwoot_contact_phone(payload) == configured_phone
+        and conv.external_conversation_id == str(settings.chat_reset_conversation_id)
+    )
 
 
 def _collect_inputs(

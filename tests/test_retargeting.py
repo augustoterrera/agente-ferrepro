@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime
 from unittest.mock import patch
 
-from app import chat_memory, retargeting
+from app import chat_memory, chatwoot_service, retargeting
 from app.chat_memory import Conversation
 from app.agent import _answer_product_ids, _filter_requested_product_type
 from app.chatwoot import ChatwootClient, chatwoot_contact_phone
@@ -156,6 +156,55 @@ class RetargetingChecks(unittest.TestCase):
         self.assertEqual(job_id, 9)
         self.assertEqual(rpc.call_args.args[0], "chat_persist_incoming_event")
 
+    def test_reset_autorizado_borra_historial_sin_llamar_al_agente(self) -> None:
+        conversation = Conversation(5, "chatwoot", "8", "6")
+        pending = [
+            {
+                "id": 10,
+                "content": "/reset",
+                "raw_payload": {"sender": {"phone_number": "+54 9 381 650-6312"}},
+            }
+        ]
+        with (
+            patch.object(chatwoot_service.settings, "chat_reset_phone", "5493816506312"),
+            patch.object(chatwoot_service.settings, "chat_reset_conversation_id", "8"),
+            patch.object(chatwoot_service.chat_memory, "get_conversation", return_value=conversation),
+            patch.object(chatwoot_service.chat_memory, "pending_messages", return_value=pending),
+            patch.object(chatwoot_service.chat_memory, "recent_history", return_value=[]),
+            patch.object(chatwoot_service.chat_memory, "clear_conversation_history") as cleared,
+            patch.object(chatwoot_service.chat_memory, "create_outbox", return_value={"id": 99}) as created,
+            patch.object(chatwoot_service.chat_memory, "hide_messages_from_history") as hidden,
+            patch.object(chatwoot_service.chat_memory, "update_jobs"),
+            patch.object(chatwoot_service.chat_memory, "update_events"),
+            patch.object(chatwoot_service, "sync_crm_contact"),
+            patch.object(chatwoot_service, "run_agent_reply") as agent,
+        ):
+            result = chatwoot_service.process_pending_conversation_messages(5)
+
+        self.assertEqual(result, (99, False))
+        cleared.assert_called_once_with(5)
+        hidden.assert_called_once_with([10])
+        self.assertEqual(created.call_args.kwargs["raw_payload"], {"memory_reset": True})
+        agent.assert_not_called()
+
+    def test_reset_requiere_telefono_y_conversacion_correctos(self) -> None:
+        with (
+            patch.object(chatwoot_service.settings, "chat_reset_phone", "5493816506312"),
+            patch.object(chatwoot_service.settings, "chat_reset_conversation_id", "8"),
+        ):
+            self.assertFalse(
+                chatwoot_service._reset_authorized(
+                    Conversation(5, "chatwoot", "9", "6"),
+                    {"sender": {"phone_number": "+54 9 381 650-6312"}},
+                )
+            )
+            self.assertFalse(
+                chatwoot_service._reset_authorized(
+                    Conversation(5, "chatwoot", "8", "6"),
+                    {"sender": {"phone_number": "+54 9 381 000-0000"}},
+                )
+            )
+
     def test_extrae_ids_de_productos_mostrados(self) -> None:
         self.assertEqual(
             _answer_product_ids(
@@ -192,7 +241,11 @@ class RetargetingChecks(unittest.TestCase):
         )
 
     def test_envio_catalogo_usa_content_id_de_variante(self) -> None:
-        outbox = {"raw_payload": {"customer_phone": "5493815551234", "meta_product_product_ids": [350971067]}}
+        outbox = {
+            "id": 1,
+            "content": "Taladro con precio y link",
+            "raw_payload": {"customer_phone": "5493815551234", "meta_product_product_ids": [350971067]},
+        }
         sent: list[dict] = []
 
         def _send(payload):
@@ -203,10 +256,12 @@ class RetargetingChecks(unittest.TestCase):
             patch.object(tasks.settings, "meta_access_token", "token"),
             patch.object(tasks.settings, "meta_phone_number_id", "phone-id"),
             patch.object(tasks.settings, "meta_catalog_id", "catalog-id"),
-            patch.object(tasks, "product_retailer_ids", return_value=["1544613986"]),
+            patch.object(tasks, "product_retailer_ids_by_product", return_value={350971067: "1544613986"}),
+            patch.object(tasks, "available_catalog_retailer_ids", return_value={"1544613986"}),
             patch.object(tasks, "send_whatsapp", side_effect=_send),
         ):
-            response = tasks._send_meta_products_if_any(outbox)
+            plan = tasks._meta_product_plan(outbox)
+            response = tasks._send_meta_product_plan(plan or {})
 
         self.assertEqual(response, {"messages": [{"id": "wamid.test"}]})
         self.assertEqual(sent[0]["interactive"]["action"]["product_retailer_id"], "1544613986")
@@ -230,7 +285,17 @@ class RetargetingChecks(unittest.TestCase):
             patch.object(tasks.chat_memory, "get_conversation", return_value=Conversation(5, "chatwoot", "8", "6")),
             patch.object(tasks.chat_memory, "mark_outbox_sent") as marked,
             patch.object(tasks, "build_chatwoot_client", return_value=_Client()),
-            patch.object(tasks, "_send_meta_products_if_any", return_value={"messages": [{"id": "wamid.test"}]}),
+            patch.object(
+                tasks,
+                "_meta_product_plan",
+                return_value={
+                    "payload": {},
+                    "catalog_product_ids": [352305267],
+                    "catalog_text": "Zorra con precio y link",
+                    "remaining_text": None,
+                },
+            ),
+            patch.object(tasks, "_send_meta_product_plan", return_value={"messages": [{"id": "wamid.test"}]}),
             patch.object(tasks, "_handoff_if_needed", return_value=False),
         ):
             tasks.send_chatwoot_outbound_message("1")
@@ -248,8 +313,12 @@ class RetargetingChecks(unittest.TestCase):
         self.assertEqual(
             marked.call_args.args[1],
             {
-                "meta": {"messages": [{"id": "wamid.test"}]},
+                "meta": {
+                    "response": {"messages": [{"id": "wamid.test"}]},
+                    "product_ids": [352305267],
+                },
                 "chatwoot_private": {"id": 10, "private": True},
+                "chatwoot_remaining": None,
             },
         )
 
@@ -272,12 +341,68 @@ class RetargetingChecks(unittest.TestCase):
             patch.object(tasks.chat_memory, "get_conversation", return_value=Conversation(5, "chatwoot", "8", "6")),
             patch.object(tasks.chat_memory, "mark_outbox_sent"),
             patch.object(tasks, "build_chatwoot_client", return_value=_Client()),
-            patch.object(tasks, "_send_meta_products_if_any", return_value={"error": "no aprobado"}),
+            patch.object(tasks, "_meta_product_plan", return_value={"error": "no aprobado"}),
             patch.object(tasks, "_handoff_if_needed", return_value=False),
         ):
             tasks.send_chatwoot_outbound_message("1")
 
         self.assertEqual(posts, ["Producto con precio y link"])
+
+    def test_envio_mixto_no_repite_productos(self) -> None:
+        content = (
+            "Mirá estas opciones 👇\n\n"
+            "Marca · Producto A\nPrecio: $10\n🔗 https://tienda.test/a/\n\n"
+            "Marca · Producto B\nPrecio: $20\n🔗 https://tienda.test/b/\n\n"
+            "Marca · Producto C\nPrecio: $30\n🔗 https://tienda.test/c/\n\n"
+            "¿Querés avanzar con alguno?"
+        )
+        catalog_text, remaining_text = tasks._split_catalog_content(
+            content,
+            [1, 2, 3],
+            {1: "https://tienda.test/a", 2: "https://tienda.test/b", 3: "https://tienda.test/c"},
+            {1, 2},
+        ) or ("", "")
+        outbox = {
+            "id": 1, "conversation_id": 5, "external_conversation_id": "8", "status": "pending",
+            "content": content, "attempts": 0, "idempotency_key": "chatwoot:8:x",
+            "created_at": "2026-08-04T09:00:00+00:00",
+        }
+        posts: list[tuple[str, bool]] = []
+
+        class _Client:
+            def create_outgoing_message(self, _a, _c, message, *, private=False):
+                posts.append((message, private))
+                return {"id": len(posts), "private": private}
+
+        with (
+            patch.object(tasks.chat_memory, "get_outbox", return_value=outbox),
+            patch.object(tasks.chat_memory, "mark_outbox_processing", return_value=True),
+            patch.object(tasks.chat_memory, "get_conversation", return_value=Conversation(5, "chatwoot", "8", "6")),
+            patch.object(tasks.chat_memory, "mark_outbox_sent"),
+            patch.object(tasks, "build_chatwoot_client", return_value=_Client()),
+            patch.object(
+                tasks,
+                "_meta_product_plan",
+                return_value={
+                    "payload": {}, "catalog_product_ids": [1, 2],
+                    "catalog_text": catalog_text, "remaining_text": remaining_text,
+                },
+            ),
+            patch.object(tasks, "_send_meta_product_plan", return_value={"messages": [{"id": "wamid.test"}]}),
+            patch.object(tasks, "_handoff_if_needed", return_value=False),
+        ):
+            tasks.send_chatwoot_outbound_message("1")
+
+        self.assertEqual(len(posts), 2)
+        self.assertTrue(posts[0][1])
+        self.assertFalse(posts[1][1])
+        self.assertIn("/a/", posts[0][0])
+        self.assertIn("/b/", posts[0][0])
+        self.assertNotIn("/c/", posts[0][0])
+        self.assertIn("También tenemos estas opciones", posts[1][0])
+        self.assertIn("/c/", posts[1][0])
+        self.assertNotIn("/a/", posts[1][0])
+        self.assertNotIn("/b/", posts[1][0])
 
 
 if __name__ == "__main__":

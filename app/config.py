@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     require_webhook_secret: bool = False
     chatwoot_history_limit: int = 16
     chatwoot_agent_limit: int = 5
+    # Comando administrativo /reset. Ambos valores deben coincidir con el webhook entrante.
+    chat_reset_phone: str | None = None
+    chat_reset_conversation_id: str | None = None
     # Namespace de conversaciones en las tablas chat_*. DB propia de Ferrepro → "chatwoot"
     # no colisiona con nadie.
     channel: str = "chatwoot"

@@ -30,6 +30,7 @@ FIXED_LINKS = {
     "https://www.ferreproindustrial.com/productos/",
 }
 PRODUCT_URL_PREFIX = "https://www.ferreproindustrial.com/productos/"
+MAX_PRESENTED_PRODUCTS = 5
 
 
 class AgentError(RuntimeError):
@@ -51,6 +52,7 @@ class Deps:
 class AgentReply:
     text: str
     product_ids: list[int]
+    product_urls: dict[int, str] = field(default_factory=dict)
 
 
 def build_agent() -> Agent[Deps, str]:
@@ -71,6 +73,7 @@ def build_agent() -> Agent[Deps, str]:
     ) -> list[dict[str, Any]]:
         """Busca productos. Por defecto solo con stock. Pasá incluir_sin_stock=true para verificar
         si un producto existe aunque esté sin stock (devuelve en_stock por ítem)."""
+        limite = min(max(1, limite), MAX_PRESENTED_PRODUCTS)
         search_limit = limite + len(ctx.deps.seen_links) if ctx.deps.seen_links and not incluir_sin_stock else limite
         productos = _buscar(consulta, limite=search_limit, solo_con_stock=not incluir_sin_stock)
         productos = _filter_requested_product_type(productos, ctx.deps.current_message)
@@ -150,7 +153,9 @@ def run_agent_reply(
     except Exception as exc:
         raise AgentError(f"Falló la corrida del agente: {exc}") from exc
     answer = guard_links(result.output, deps.shown_links | FIXED_LINKS)
-    return AgentReply(answer, _answer_product_ids(answer, deps.product_ids_by_link))
+    product_ids = _answer_product_ids(answer, deps.product_ids_by_link)
+    product_urls = {product_id: link for link, product_id in deps.product_ids_by_link.items() if product_id in product_ids}
+    return AgentReply(answer, product_ids, product_urls)
 
 
 def _build_input(message: str, history: list[AgentMessage]) -> str:
@@ -198,7 +203,7 @@ def _answer_product_ids(answer: str, product_ids_by_link: dict[str, int]) -> lis
         if product_id is not None and product_id not in seen:
             ids.append(product_id)
             seen.add(product_id)
-    return ids[:30]
+    return ids[:MAX_PRESENTED_PRODUCTS]
 
 
 def _asks_to_repeat(message: str) -> bool:

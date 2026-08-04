@@ -211,6 +211,26 @@ def mark_messages_processed(message_ids: list[int]) -> None:
     supabase.update("chat_messages", f"id=in.({ids})", {"processing_status": "processed"})
 
 
+def clear_conversation_history(conversation_id: int) -> None:
+    """Borra el historial que consume la IA, sin tocar mensajes nuevos todavía pendientes."""
+    supabase.delete(
+        "chat_messages",
+        f"conversation_id=eq.{conversation_id}&processing_status=eq.processed",
+    )
+    supabase.update("chat_conversations", f"id=eq.{conversation_id}", {"state": {}})
+
+
+def hide_messages_from_history(message_ids: list[int]) -> None:
+    if not message_ids:
+        return
+    ids = ",".join(str(message_id) for message_id in message_ids)
+    supabase.update(
+        "chat_messages",
+        f"id=in.({ids})",
+        {"role": "system", "processing_status": "processed", "processed_at": _now()},
+    )
+
+
 def recent_history(conversation_id: int, limit: int = 16, exclude_ids: set[int] | None = None) -> list[AgentMessage]:
     rows = supabase.select(
         "chat_messages",
