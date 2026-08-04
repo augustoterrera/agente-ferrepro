@@ -31,6 +31,7 @@ FIXED_LINKS = {
 }
 PRODUCT_URL_PREFIX = "https://www.ferreproindustrial.com/productos/"
 MAX_PRESENTED_PRODUCTS = 5
+MAX_EXPLICIT_PRODUCTS = 10
 
 
 class AgentError(RuntimeError):
@@ -73,12 +74,18 @@ def build_agent() -> Agent[Deps, str]:
     ) -> list[dict[str, Any]]:
         """Busca productos. Por defecto solo con stock. Pasá incluir_sin_stock=true para verificar
         si un producto existe aunque esté sin stock (devuelve en_stock por ítem)."""
-        limite = min(max(1, limite), MAX_PRESENTED_PRODUCTS)
+        requested_limit = _requested_product_limit(ctx.deps.current_message)
+        limite = requested_limit if requested_limit > MAX_PRESENTED_PRODUCTS else min(max(1, limite), requested_limit)
         search_limit = limite + len(ctx.deps.seen_links) if ctx.deps.seen_links and not incluir_sin_stock else limite
-        productos = _buscar(consulta, limite=search_limit, solo_con_stock=not incluir_sin_stock)
-        productos = _filter_requested_product_type(productos, ctx.deps.current_message)
+        productos = _search_requested_product_types(
+            consulta,
+            ctx.deps.current_message,
+            limite=search_limit,
+            solo_con_stock=not incluir_sin_stock,
+        )
         if ctx.deps.seen_links and not incluir_sin_stock:
-            productos = [p for p in productos if _norm_url(p.canonical_url) not in ctx.deps.seen_links][:limite]
+            productos = [p for p in productos if _norm_url(p.canonical_url) not in ctx.deps.seen_links]
+        productos = productos[:limite]
         for p in productos:
             if p.canonical_url:
                 link = _norm_url(p.canonical_url)
@@ -153,7 +160,11 @@ def run_agent_reply(
     except Exception as exc:
         raise AgentError(f"Falló la corrida del agente: {exc}") from exc
     answer = guard_links(result.output, deps.shown_links | FIXED_LINKS)
-    product_ids = _answer_product_ids(answer, deps.product_ids_by_link)
+    product_ids = _answer_product_ids(
+        answer,
+        deps.product_ids_by_link,
+        limit=_requested_product_limit(message),
+    )
     product_urls = {product_id: link for link, product_id in deps.product_ids_by_link.items() if product_id in product_ids}
     return AgentReply(answer, product_ids, product_urls)
 
@@ -169,13 +180,42 @@ def _build_input(message: str, history: list[AgentMessage]) -> str:
 
 _URL_RE = re.compile(r"https?://\S+")
 _PRODUCT_TYPE_PATTERNS = (
-    re.compile(r"\b(?:zorras?|transpaletas?)\b", re.IGNORECASE),
-    re.compile(r"\bapilador(?:a|es|as)?\b", re.IGNORECASE),
+    (re.compile(r"\b(?:zorras?|transpaletas?)\b", re.IGNORECASE), "zorra hidráulica"),
+    (re.compile(r"\bapilador(?:a|es|as)?\b", re.IGNORECASE), "apilador"),
 )
+_ALL_PRODUCTS_RE = re.compile(r"\b(?:todos?|todas?)\b", re.IGNORECASE)
+
+
+def _requested_product_limit(request: str) -> int:
+    return MAX_EXPLICIT_PRODUCTS if _ALL_PRODUCTS_RE.search(request) else MAX_PRESENTED_PRODUCTS
+
+
+def _search_requested_product_types(
+    query: str,
+    request: str,
+    *,
+    limite: int,
+    solo_con_stock: bool,
+) -> list[Product]:
+    requested = [(pattern, search_term) for pattern, search_term in _PRODUCT_TYPE_PATTERNS if pattern.search(request)]
+    if len(requested) < 2:
+        return _filter_requested_product_type(
+            _buscar(query, limite=limite, solo_con_stock=solo_con_stock),
+            request,
+        )
+
+    products: list[Product] = []
+    seen_ids: set[int] = set()
+    for pattern, search_term in requested:
+        for product in _buscar(search_term, limite=limite, solo_con_stock=solo_con_stock):
+            if product.id not in seen_ids and pattern.search(product.name):
+                products.append(product)
+                seen_ids.add(product.id)
+    return products[:limite]
 
 
 def _filter_requested_product_type(products: list[Product], request: str) -> list[Product]:
-    requested = [pattern for pattern in _PRODUCT_TYPE_PATTERNS if pattern.search(request)]
+    requested = [pattern for pattern, _ in _PRODUCT_TYPE_PATTERNS if pattern.search(request)]
     if not requested:
         return products
     return [product for product in products if any(pattern.search(product.name) for pattern in requested)]
@@ -195,7 +235,12 @@ def _history_product_links(history: list[AgentMessage]) -> set[str]:
     return urls
 
 
-def _answer_product_ids(answer: str, product_ids_by_link: dict[str, int]) -> list[int]:
+def _answer_product_ids(
+    answer: str,
+    product_ids_by_link: dict[str, int],
+    *,
+    limit: int = MAX_PRESENTED_PRODUCTS,
+) -> list[int]:
     ids: list[int] = []
     seen: set[int] = set()
     for url in _URL_RE.findall(answer):
@@ -203,7 +248,7 @@ def _answer_product_ids(answer: str, product_ids_by_link: dict[str, int]) -> lis
         if product_id is not None and product_id not in seen:
             ids.append(product_id)
             seen.add(product_id)
-    return ids[:MAX_PRESENTED_PRODUCTS]
+    return ids[:limit]
 
 
 def _asks_to_repeat(message: str) -> bool:

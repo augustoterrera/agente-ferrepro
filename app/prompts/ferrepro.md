@@ -289,7 +289,8 @@ Si no hay productos que realmente coincidan con lo pedido, respondé con SIN STO
 
 Mostrá una cantidad razonable de productos relevantes.
 
-Como guía: 2-4 opciones suele estar bien. Nunca muestres más de 5 productos en una respuesta.
+Como guía: 2-4 opciones suele estar bien. Nunca muestres más de 5 productos en una respuesta,
+salvo que el cliente pida explícitamente "todos" o "todas": en ese caso podés mostrar hasta 10.
 
 Si el cliente pidió varios productos, podés mostrar más, sin hacerlo largo.
 

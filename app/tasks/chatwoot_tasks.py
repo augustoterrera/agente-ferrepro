@@ -340,7 +340,7 @@ def _meta_product_plan(outbox: dict) -> dict[str, object] | None:
     phone = raw.get("customer_phone")
     product_ids = list(
         dict.fromkeys(int(pid) for pid in raw.get("meta_product_product_ids") or [] if str(pid).isdigit())
-    )[:5]
+    )[:10]
     if not (phone and product_ids and settings.meta_access_token and settings.meta_phone_number_id and settings.meta_catalog_id):
         return None
     try:

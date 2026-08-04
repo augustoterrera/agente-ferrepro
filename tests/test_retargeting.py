@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import io
+import json
 import unittest
 from datetime import datetime
 from unittest.mock import patch
 
-from app import chat_memory, chatwoot_service, retargeting
+from app import chat_memory, chatwoot_service, meta, retargeting
 from app.chat_memory import Conversation
-from app.agent import _answer_product_ids, _filter_requested_product_type
+from app.agent import (
+    _answer_product_ids,
+    _filter_requested_product_type,
+    _requested_product_limit,
+    _search_requested_product_types,
+)
 from app.chatwoot import ChatwootClient, chatwoot_contact_phone
 from app.models import Product
 from app.tasks import chatwoot_tasks as tasks
@@ -234,6 +241,25 @@ class RetargetingChecks(unittest.TestCase):
             [2],
         )
 
+    def test_todas_busca_cada_tipo_y_permite_hasta_diez(self) -> None:
+        products = [Product(id=1, name="ZORRA HIDRAULICA 3TN")]
+        products += [Product(id=index, name=f"APILADOR {index}") for index in range(2, 7)]
+
+        def search(query: str, **_kwargs):
+            return products[:1] if "zorra" in query else products[1:]
+
+        request = "mostrame la zorra y todas las apiladoras"
+        with patch("app.agent._buscar", side_effect=search):
+            result = _search_requested_product_types(
+                request,
+                request,
+                limite=_requested_product_limit(request),
+                solo_con_stock=True,
+            )
+
+        self.assertEqual(_requested_product_limit(request), 10)
+        self.assertEqual([product.id for product in result], [1, 2, 3, 4, 5, 6])
+
     def test_telefono_chatwoot_sirve_para_meta(self) -> None:
         self.assertEqual(
             chatwoot_contact_phone({"sender": {"phone_number": "+54 9 381 555-1234"}}),
@@ -265,6 +291,34 @@ class RetargetingChecks(unittest.TestCase):
 
         self.assertEqual(response, {"messages": [{"id": "wamid.test"}]})
         self.assertEqual(sent[0]["interactive"]["action"]["product_retailer_id"], "1544613986")
+
+    def test_catalogo_solo_usa_productos_aprobados_para_whatsapp(self) -> None:
+        response = io.BytesIO(
+            json.dumps(
+                {
+                    "data": [
+                        {
+                            "retailer_id": "visible",
+                            "visibility": "published",
+                            "availability": "in stock",
+                            "capability_to_review_status": [{"key": "WHATSAPP", "value": "APPROVED"}],
+                        },
+                        {
+                            "retailer_id": "oculto",
+                            "visibility": "published",
+                            "availability": "in stock",
+                            "capability_to_review_status": [{"key": "WHATSAPP", "value": "NO_REVIEW"}],
+                        },
+                    ]
+                }
+            ).encode()
+        )
+        with (
+            patch.object(meta.settings, "meta_access_token", "token"),
+            patch.object(meta.settings, "meta_catalog_id", "catalog-id"),
+            patch.object(meta.urllib.request, "urlopen", return_value=response),
+        ):
+            self.assertEqual(meta.available_catalog_retailer_ids(["visible", "oculto"]), {"visible"})
 
     def test_catalogo_exitoso_solo_deja_nota_privada_en_chatwoot(self) -> None:
         outbox = {

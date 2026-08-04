@@ -87,7 +87,7 @@ def available_catalog_retailer_ids(retailer_ids: list[str]) -> set[str]:
     ids = list(dict.fromkeys(str(value) for value in retailer_ids))[:30]
     query = urllib.parse.urlencode(
         {
-            "fields": "retailer_id,visibility,availability",
+            "fields": "retailer_id,visibility,availability,capability_to_review_status",
             "filter": json.dumps({"retailer_id": {"is_any": ids}}),
             "limit": len(ids),
         }
@@ -114,6 +114,12 @@ def available_catalog_retailer_ids(retailer_ids: list[str]) -> set[str]:
         and row.get("retailer_id")
         and str(row.get("visibility") or "").lower() == "published"
         and str(row.get("availability") or "").lower() not in {"out of stock", "discontinued"}
+        and any(
+            str(capability.get("key") or "").upper() == "WHATSAPP"
+            and str(capability.get("value") or "").upper() == "APPROVED"
+            for capability in row.get("capability_to_review_status") or []
+            if isinstance(capability, dict)
+        )
     }
 
 
