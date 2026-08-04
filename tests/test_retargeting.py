@@ -351,7 +351,18 @@ class RetargetingChecks(unittest.TestCase):
             "app.meta.select",
             side_effect=[
                 [{"id": 101, "product_id": 1}, {"id": 202, "product_id": 2}],
-                [{"id": 1, "name": "Zorra hidráulica"}, {"id": 2, "name": "Apilador"}],
+                [
+                    {
+                        "id": 1,
+                        "name": "Zorra hidráulica",
+                        "canonical_url": "https://www.ferreproindustrial.com/productos/zorra/",
+                    },
+                    {
+                        "id": 2,
+                        "name": "Apilador",
+                        "canonical_url": "https://www.ferreproindustrial.com/productos/apilador/",
+                    },
+                ],
             ],
         ):
             transformed, count = meta.transform_order_messages(payload)
@@ -362,6 +373,8 @@ class RetargetingChecks(unittest.TestCase):
         self.assertNotIn("order", message)
         self.assertIn("1 x Zorra hidráulica", message["text"]["body"])
         self.assertIn("2 x Apilador", message["text"]["body"])
+        self.assertIn("https://www.ferreproindustrial.com/productos/zorra/", message["text"]["body"])
+        self.assertIn("https://www.ferreproindustrial.com/productos/apilador/", message["text"]["body"])
 
         raw = b'{"test":true}'
         with patch.object(meta.settings, "meta_app_secret", "secret"):

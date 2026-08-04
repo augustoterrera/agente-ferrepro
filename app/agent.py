@@ -147,9 +147,12 @@ def run_agent_reply(
     if scoped_reply:
         return AgentReply(scoped_reply, [])
     agent = build_agent()
+    history_links = _history_product_links(history)
+    repeat_links = _asks_to_repeat(message)
     deps = Deps(
         current_message=message,
-        seen_links=set() if _asks_to_repeat(message) else _history_product_links(history),
+        shown_links=history_links if repeat_links else set(),
+        seen_links=set() if repeat_links else history_links,
     )
     text = _build_input(message, history)
     prompt: object = text
@@ -253,7 +256,7 @@ def _answer_product_ids(
 
 def _asks_to_repeat(message: str) -> bool:
     text = message.lower()
-    return "link" in text or "de nuevo" in text or "otra vez" in text or "repet" in text
+    return "link" in text or "online" in text or "de nuevo" in text or "otra vez" in text or "repet" in text
 
 
 def guard_links(answer: str, allowed: set[str]) -> str:
@@ -279,6 +282,7 @@ if __name__ == "__main__":
     }
     assert _answer_product_ids(f"🔗 {PRODUCT_URL_PREFIX}x/", {f"{PRODUCT_URL_PREFIX}x": 10}) == [10]
     assert _asks_to_repeat("pasame el link de nuevo")
+    assert _asks_to_repeat("puedo comprarlo online")
     assert "no vendemos celulares" in run_agent("Y los celulares cuánto está")
     assert "no vendemos celulares" in run_agent("Motorola e14")
     print("guard puro: OK")

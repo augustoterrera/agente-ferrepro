@@ -87,13 +87,21 @@ def catalog_order_text(order: dict[str, Any]) -> str:
     variants = select("ferrepro_variantes", f"id=in.({ids})&select=id,product_id")
     product_ids = [str(row["product_id"]) for row in variants if row.get("product_id") is not None]
     products = (
-        select("ferrepro_productos", f"id=in.({','.join(dict.fromkeys(product_ids))})&select=id,name")
+        select(
+            "ferrepro_productos",
+            f"id=in.({','.join(dict.fromkeys(product_ids))})&select=id,name,canonical_url",
+        )
         if product_ids
         else []
     )
     product_by_id = {str(row["id"]): str(row.get("name") or "Producto") for row in products}
+    url_by_id = {str(row["id"]): str(row.get("canonical_url") or "") for row in products}
     name_by_retailer = {
         str(row["id"]): product_by_id.get(str(row.get("product_id")), f"Producto {row['id']}")
+        for row in variants
+    }
+    url_by_retailer = {
+        str(row["id"]): url_by_id.get(str(row.get("product_id")), "")
         for row in variants
     }
     lines = ["Seleccioné estos productos del catálogo y quiero comprarlos:"]
@@ -101,6 +109,8 @@ def catalog_order_text(order: dict[str, Any]) -> str:
         retailer_id = str(item.get("product_retailer_id") or "")
         quantity = item.get("quantity") or 1
         lines.append(f"- {quantity} x {name_by_retailer.get(retailer_id, f'Producto {retailer_id}')}")
+        if url := url_by_retailer.get(retailer_id):
+            lines.append(f"  Link: {url}")
     return "\n".join(lines)
 
 
