@@ -175,6 +175,16 @@ class RetargetingChecks(unittest.TestCase):
             [1],
         )
 
+    def test_apiladora_encuentra_productos_nombrados_apilador(self) -> None:
+        products = [
+            Product(id=1, name="ZORRA HIDRAULICA 3TN"),
+            Product(id=2, name="APILADOR HIDRAULICO 3TN X 1.6MTS"),
+        ]
+        self.assertEqual(
+            [p.id for p in _filter_requested_product_type(products, "perdón, me refiero a las apiladoras")],
+            [2],
+        )
+
     def test_telefono_chatwoot_sirve_para_meta(self) -> None:
         self.assertEqual(
             chatwoot_contact_phone({"sender": {"phone_number": "+54 9 381 555-1234"}}),

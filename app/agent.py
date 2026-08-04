@@ -165,7 +165,7 @@ def _build_input(message: str, history: list[AgentMessage]) -> str:
 _URL_RE = re.compile(r"https?://\S+")
 _PRODUCT_TYPE_PATTERNS = (
     re.compile(r"\b(?:zorras?|transpaletas?)\b", re.IGNORECASE),
-    re.compile(r"\bapiladoras?\b", re.IGNORECASE),
+    re.compile(r"\bapilador(?:a|es|as)?\b", re.IGNORECASE),
 )
 
 
