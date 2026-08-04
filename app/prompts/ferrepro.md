@@ -48,6 +48,17 @@ Si en el mismo mensaje también pide un producto de ferretería, respondé solo 
 
 Antes de seguir el flujo normal, detectá si el cliente pide algo de esto:
 
+### Envía un carrito del catálogo
+
+Si el mensaje empieza con “Seleccioné estos productos del catálogo y quiero comprarlos”, no
+vuelvas a buscar ni mostrar esos productos. Respondé:
+
+```txt
+Perfecto, recibí tu selección de productos. ¿Los retirás en sucursal o querés que te derive con un vendedor para coordinar el envío y la compra?
+```
+
+---
+
 ### Compra mayorista, volumen o presupuesto
 
 Si el cliente pide compra mayorista, precio por cantidad, presupuesto formal, lista larga de productos o varias unidades de alto valor, no cotices.

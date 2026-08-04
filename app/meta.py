@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import urllib.error
 import urllib.parse
@@ -12,6 +14,94 @@ from .supabase import select
 
 class MetaError(RuntimeError):
     pass
+
+
+def verify_webhook_signature(raw_body: bytes, signature: str | None) -> bool:
+    if not (settings.meta_app_secret and signature):
+        return False
+    expected = "sha256=" + hmac.new(
+        settings.meta_app_secret.encode("utf-8"), raw_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def relay_webhook(raw_body: bytes) -> int:
+    if not (settings.meta_app_secret and settings.meta_webhook_forward_url):
+        raise MetaError("Faltan META_APP_SECRET / META_WEBHOOK_FORWARD_URL.")
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError as exc:
+        raise MetaError("Meta envió un webhook inválido.") from exc
+    if not isinstance(payload, dict):
+        raise MetaError("Meta envió un webhook inválido.")
+
+    transformed, order_count = transform_order_messages(payload)
+    body = json.dumps(transformed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    signature = "sha256=" + hmac.new(
+        settings.meta_app_secret.encode("utf-8"), body, hashlib.sha256
+    ).hexdigest()
+    request = urllib.request.Request(
+        settings.meta_webhook_forward_url,
+        data=body,
+        headers={"Content-Type": "application/json", "X-Hub-Signature-256": signature},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            if response.status >= 300:
+                raise MetaError(f"Chatwoot respondió HTTP {response.status} al webhook de Meta.")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise MetaError(f"Chatwoot webhook HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise MetaError(f"No se pudo reenviar el webhook de Meta a Chatwoot: {exc.reason}") from exc
+    return order_count
+
+
+def transform_order_messages(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    orders = 0
+    for entry in payload.get("entry") or []:
+        if not isinstance(entry, dict):
+            continue
+        for change in entry.get("changes") or []:
+            value = change.get("value") if isinstance(change, dict) else None
+            if not isinstance(value, dict):
+                continue
+            for message in value.get("messages") or []:
+                if not isinstance(message, dict) or message.get("type") != "order":
+                    continue
+                message["type"] = "text"
+                message["text"] = {"body": catalog_order_text(message.get("order") or {})}
+                message.pop("order", None)
+                orders += 1
+    return payload, orders
+
+
+def catalog_order_text(order: dict[str, Any]) -> str:
+    items = [item for item in order.get("product_items") or [] if isinstance(item, dict)][:30]
+    retailer_ids = [str(item.get("product_retailer_id")) for item in items if item.get("product_retailer_id")]
+    if not retailer_ids:
+        return "Seleccioné productos del catálogo y quiero comprarlos."
+
+    ids = ",".join(dict.fromkeys(retailer_ids))
+    variants = select("ferrepro_variantes", f"id=in.({ids})&select=id,product_id")
+    product_ids = [str(row["product_id"]) for row in variants if row.get("product_id") is not None]
+    products = (
+        select("ferrepro_productos", f"id=in.({','.join(dict.fromkeys(product_ids))})&select=id,name")
+        if product_ids
+        else []
+    )
+    product_by_id = {str(row["id"]): str(row.get("name") or "Producto") for row in products}
+    name_by_retailer = {
+        str(row["id"]): product_by_id.get(str(row.get("product_id")), f"Producto {row['id']}")
+        for row in variants
+    }
+    lines = ["Seleccioné estos productos del catálogo y quiero comprarlos:"]
+    for item in items:
+        retailer_id = str(item.get("product_retailer_id") or "")
+        quantity = item.get("quantity") or 1
+        lines.append(f"- {quantity} x {name_by_retailer.get(retailer_id, f'Producto {retailer_id}')}")
+    return "\n".join(lines)
 
 
 def product_list_payload(to: str, product_ids: list[str | int], *, body: str, header: str = "Productos") -> dict[str, Any]:

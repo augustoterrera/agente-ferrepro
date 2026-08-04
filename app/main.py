@@ -4,11 +4,11 @@ import logging
 import secrets
 import traceback
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
-from . import notifier
+from . import meta, notifier
 
 from .chatwoot import (
     ChatwootError,
@@ -61,7 +61,36 @@ def health() -> dict[str, object]:
         "has_chatwoot": bool(settings.chatwoot_url and settings.chatwoot_access_token),
         "has_webhook_secret": bool(settings.chatwoot_webhook_secret),
         "has_meta": bool(settings.meta_access_token and settings.meta_phone_number_id and settings.meta_catalog_id),
+        "has_meta_webhook": bool(
+            settings.meta_app_secret and settings.meta_verify_token and settings.meta_webhook_forward_url
+        ),
     }
+
+
+@app.get("/webhooks/meta", response_class=PlainTextResponse)
+def verify_meta_webhook(
+    mode: str = Query(default="", alias="hub.mode"),
+    token: str = Query(default="", alias="hub.verify_token"),
+    challenge: str = Query(default="", alias="hub.challenge"),
+) -> str:
+    if mode != "subscribe" or not settings.meta_verify_token or not secrets.compare_digest(
+        token, settings.meta_verify_token
+    ):
+        raise HTTPException(status_code=403, detail="Token de verificación inválido")
+    return challenge
+
+
+@app.post("/webhooks/meta")
+async def meta_webhook(request: Request) -> dict[str, object]:
+    raw_body = await request.body()
+    if not meta.verify_webhook_signature(raw_body, request.headers.get("x-hub-signature-256")):
+        raise HTTPException(status_code=401, detail="Firma de Meta inválida")
+    try:
+        orders = await run_in_threadpool(meta.relay_webhook, raw_body)
+    except meta.MetaError as exc:
+        logger.exception("meta_webhook_relay_failed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True, "orders": orders}
 
 
 @app.post("/webhooks/chatwoot")

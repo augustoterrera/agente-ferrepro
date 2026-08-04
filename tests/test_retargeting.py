@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import io
 import json
 import unittest
@@ -319,6 +321,53 @@ class RetargetingChecks(unittest.TestCase):
             patch.object(meta.urllib.request, "urlopen", return_value=response),
         ):
             self.assertEqual(meta.available_catalog_retailer_ids(["visible", "oculto"]), {"visible"})
+
+    def test_pedido_del_catalogo_se_convierte_en_texto_para_chatwoot(self) -> None:
+        payload = {
+            "entry": [
+                {
+                    "changes": [
+                        {
+                            "value": {
+                                "messages": [
+                                    {
+                                        "id": "wamid.order",
+                                        "type": "order",
+                                        "order": {
+                                            "product_items": [
+                                                {"product_retailer_id": "101", "quantity": 1},
+                                                {"product_retailer_id": "202", "quantity": 2},
+                                            ]
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+        with patch(
+            "app.meta.select",
+            side_effect=[
+                [{"id": 101, "product_id": 1}, {"id": 202, "product_id": 2}],
+                [{"id": 1, "name": "Zorra hidráulica"}, {"id": 2, "name": "Apilador"}],
+            ],
+        ):
+            transformed, count = meta.transform_order_messages(payload)
+
+        message = transformed["entry"][0]["changes"][0]["value"]["messages"][0]
+        self.assertEqual(count, 1)
+        self.assertEqual(message["type"], "text")
+        self.assertNotIn("order", message)
+        self.assertIn("1 x Zorra hidráulica", message["text"]["body"])
+        self.assertIn("2 x Apilador", message["text"]["body"])
+
+        raw = b'{"test":true}'
+        with patch.object(meta.settings, "meta_app_secret", "secret"):
+            signature = "sha256=" + hmac.new(b"secret", raw, hashlib.sha256).hexdigest()
+            self.assertTrue(meta.verify_webhook_signature(raw, signature))
+            self.assertFalse(meta.verify_webhook_signature(raw, "sha256=incorrecta"))
 
     def test_catalogo_exitoso_solo_deja_nota_privada_en_chatwoot(self) -> None:
         outbox = {

@@ -106,6 +106,9 @@ class Settings(BaseSettings):
     # Meta / WhatsApp Cloud API + Catalogo. El catalogo lo alimenta Tienda Nube; el agente solo
     # mapea producto Supabase/Tienda Nube -> variante/content_id para mandar productos nativos.
     meta_access_token: str | None = None
+    meta_app_secret: str | None = None
+    meta_verify_token: str | None = None
+    meta_webhook_forward_url: str | None = None
     meta_phone_number_id: str | None = None
     meta_catalog_id: str | None = None
     meta_graph_version: str = "v23.0"
