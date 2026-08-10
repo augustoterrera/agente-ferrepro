@@ -3,13 +3,16 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
 
 from .config import settings
-from .supabase import select
+from .supabase import SupabaseError, insert, select
+
+logger = logging.getLogger(__name__)
 
 
 class MetaError(RuntimeError):
@@ -35,6 +38,11 @@ def relay_webhook(raw_body: bytes) -> int:
     if not isinstance(payload, dict):
         raise MetaError("Meta envió un webhook inválido.")
 
+    # ANTES de reenviar: Chatwoot nos va a rebotar su propio webhook y el worker va a buscar el
+    # referral para atarlo a la conversación. Si guardáramos después, ganaría la carrera y la
+    # conversación quedaría sin atribuir.
+    save_ad_referrals(payload)
+
     transformed, order_count = transform_order_messages(payload)
     body = json.dumps(transformed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     signature = "sha256=" + hmac.new(
@@ -56,6 +64,59 @@ def relay_webhook(raw_body: bytes) -> int:
     except urllib.error.URLError as exc:
         raise MetaError(f"No se pudo reenviar el webhook de Meta a Chatwoot: {exc.reason}") from exc
     return order_count
+
+
+def extract_ad_referrals(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Referrals de anuncios click-to-WhatsApp: Meta los adosa al primer mensaje que manda el
+    cliente después de tocar el aviso. Solo vienen en ese mensaje, nunca más en la charla."""
+    referrals: list[dict[str, Any]] = []
+    for entry in payload.get("entry") or []:
+        if not isinstance(entry, dict):
+            continue
+        for change in entry.get("changes") or []:
+            value = change.get("value") if isinstance(change, dict) else None
+            if not isinstance(value, dict):
+                continue
+            for message in value.get("messages") or []:
+                if not isinstance(message, dict):
+                    continue
+                referral = message.get("referral")
+                phone = "".join(ch for ch in str(message.get("from") or "") if ch.isdigit())
+                if not isinstance(referral, dict) or not phone:
+                    continue
+                referrals.append(
+                    {
+                        "phone": phone,
+                        "wa_message_id": message.get("id"),
+                        "source_id": referral.get("source_id"),
+                        "source_type": referral.get("source_type"),
+                        "source_url": referral.get("source_url"),
+                        "headline": referral.get("headline"),
+                        "ctwa_clid": referral.get("ctwa_clid"),
+                        # Meta agrega campos al referral cada tanto; el crudo evita perderlos.
+                        "raw": referral,
+                    }
+                )
+    return referrals
+
+
+def save_ad_referrals(payload: dict[str, Any]) -> int:
+    """Fire-and-forget: un Supabase caído NO puede cortar la entrega del mensaje al cliente.
+    El costo es cero en el camino normal — solo hay referral en charlas que nacen de un aviso."""
+    referrals = extract_ad_referrals(payload)
+    guardados = 0
+    for referral in referrals:
+        try:
+            insert("chat_ad_referrals", referral, return_row=False)
+            guardados += 1
+        except SupabaseError as exc:
+            # 409 = ya lo guardamos (Meta reintenta webhooks); el resto es problema real.
+            if "409" not in str(exc):
+                logger.warning(
+                    "ad_referral_save_failed",
+                    extra={"source_id": referral.get("source_id"), "error": str(exc)},
+                )
+    return guardados
 
 
 def transform_order_messages(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:

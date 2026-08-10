@@ -355,6 +355,19 @@ def cleanup_expired_locks() -> int:
     return int(supabase.rpc("cleanup_expired_chat_conversation_locks", {}) or 0)
 
 
+# ── Atribución a pauta ──────────────────────────────────────────────────────
+def link_ad_referral(conversation_id: int, phone: str, max_age_hours: int = 72) -> dict | None:
+    """Ata el click en el anuncio (que llegó por el webhook de Meta, keyed por teléfono) a esta
+    conversación. Devuelve el referral vinculado, o None si la charla no vino de un aviso."""
+    rows = supabase.rpc(
+        "chat_link_ad_referral",
+        {"p_conversation_id": conversation_id, "p_phone": phone, "p_max_age_hours": max_age_hours},
+    )
+    if isinstance(rows, list):
+        return rows[0] if rows else None
+    return rows or None
+
+
 # ── Estado de la conversación ───────────────────────────────────────────────
 def merge_state(conversation_id: int, patch: dict[str, Any]) -> None:
     """Merge shallow sobre chat_conversations.state (jsonb ||): no pisa las otras claves."""

@@ -68,6 +68,25 @@ def sync_crm_contact(conversation_external_id: int | str | None, payload: dict[s
         logger.warning("crm_contact_sync_failed", extra={"conversation_id": conversation_id, "error": str(exc)})
 
 
+def link_ad_referral(conversation_id: int, payload: dict[str, Any]) -> None:
+    """Si la charla nació de un anuncio, ata el click a la conversación (ver migración 003).
+    Fire-and-forget e idempotente: la RPC solo toca referrals todavía sin conversación, así que
+    los turnos siguientes no hacen nada. Un fallo acá no puede costar la respuesta al cliente."""
+    phone = chatwoot_contact_phone(payload)
+    if not phone:
+        return
+    try:
+        referral = chat_memory.link_ad_referral(conversation_id, phone)
+    except supabase.SupabaseError as exc:
+        logger.warning("ad_referral_link_failed", extra={"conversation_id": conversation_id, "error": str(exc)})
+        return
+    if referral:
+        logger.info(
+            "ad_referral_linked",
+            extra={"conversation_id": conversation_id, "source_id": referral.get("source_id")},
+        )
+
+
 def sync_crm_labels(conversation_external_id: int | str, labels: list[str]) -> None:
     """Espeja en crm_contacts TODAS las etiquetas de la conversación (unidas por coma, como el
     cached_label_list de Chatwoot) para que el dashboard quede sincronizado con Chatwoot. Keyed por
@@ -118,6 +137,7 @@ def process_pending_conversation_messages(conversation_id: int) -> tuple[int, bo
     # Registrar el contacto en el CRM (idempotente, fire-and-forget). Acá y no en el webhook:
     # mantiene Supabase fuera del camino crítico de intake.
     sync_crm_contact(conv.external_conversation_id, pending[-1].get("raw_payload") or {})
+    link_ad_referral(conversation_id, pending[-1].get("raw_payload") or {})
 
     message_ids = [m["id"] for m in pending]
     user_content, images, audio_transcripts = _collect_inputs(pending)
@@ -172,7 +192,9 @@ def process_pending_conversation_messages(conversation_id: int) -> tuple[int, bo
     for message_id, transcript in audio_transcripts:
         chat_memory.set_message_content(message_id, transcript)
 
-    chat_memory.add_message(conversation_id, "assistant", answer, processing_status="processed")
+    chat_memory.add_message(
+        conversation_id, "assistant", answer, processing_status="processed", tool_calls=reply.tool_calls
+    )
     chat_memory.mark_messages_processed(message_ids)
     outbox = chat_memory.create_outbox(
         conversation_id, conv.external_conversation_id, conv.channel, answer,

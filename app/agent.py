@@ -47,6 +47,9 @@ class Deps:
     product_ids_by_link: dict[str, int] = field(default_factory=dict)
     # Links ya mostrados en turnos previos: no se vuelven a ofrecer salvo pedido explícito.
     seen_links: set[str] = field(default_factory=set)
+    # Traza de lo que hizo el agente este turno → se persiste en chat_messages.tool_calls.
+    # Es la materia prima del BI: qué buscó la gente y si el catálogo tenía con qué contestar.
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,7 @@ class AgentReply:
     text: str
     product_ids: list[int]
     product_urls: dict[int, str] = field(default_factory=dict)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 def build_agent() -> Agent[Deps, str]:
@@ -83,6 +87,9 @@ def build_agent() -> Agent[Deps, str]:
             limite=search_limit,
             solo_con_stock=not incluir_sin_stock,
         )
+        # Antes de filtrar por seen_links/limite: `encontrados == 0` es el agujero de catálogo
+        # real; `devueltos == 0` puede ser solo que ya se los mostramos en turnos previos.
+        encontrados = len(productos)
         if ctx.deps.seen_links and not incluir_sin_stock:
             productos = [p for p in productos if _norm_url(p.canonical_url) not in ctx.deps.seen_links]
         productos = productos[:limite]
@@ -91,12 +98,26 @@ def build_agent() -> Agent[Deps, str]:
                 link = _norm_url(p.canonical_url)
                 ctx.deps.shown_links.add(link)
                 ctx.deps.product_ids_by_link[link] = p.id
+        ctx.deps.tool_calls.append(
+            {
+                "tool": "buscar_productos",
+                "consulta": consulta,
+                "incluir_sin_stock": incluir_sin_stock,
+                "encontrados": encontrados,
+                "devueltos": len(productos),
+                "product_ids": [p.id for p in productos],
+            }
+        )
         return compact_for_llm(productos)
 
     @agent.tool
     def detalle_producto(ctx: RunContext[Deps], id: int) -> dict[str, Any]:
         """Detalle fino de un producto ya mostrado: peso, medidas, SKU, variantes."""
-        return _detalle(id, ctx.deps)
+        detalle = _detalle(id, ctx.deps)
+        ctx.deps.tool_calls.append(
+            {"tool": "detalle_producto", "product_id": id, "encontrado": "error" not in detalle}
+        )
+        return detalle
 
     return agent
 
@@ -143,9 +164,16 @@ def run_agent_reply(
 ) -> AgentReply:
     """`images`: lista de (bytes, media_type) para que el modelo multimodal las vea."""
     history = history or []
-    scoped_reply = scope_reply(decide_scope(message, history))
+    decision = decide_scope(message, history)
+    scoped_reply = scope_reply(decision)
     if scoped_reply:
-        return AgentReply(scoped_reply, [])
+        # Los pedidos fuera de rubro no llegan a las tools, pero son señal de demanda: se
+        # registran igual para que el BI vea qué le piden a Ferrepro que no vende.
+        return AgentReply(
+            scoped_reply,
+            [],
+            tool_calls=[{"tool": "scope", "status": decision.status, "producto": decision.product}],
+        )
     agent = build_agent()
     history_links = _history_product_links(history)
     repeat_links = _asks_to_repeat(message)
@@ -169,7 +197,7 @@ def run_agent_reply(
         limit=_requested_product_limit(message),
     )
     product_urls = {product_id: link for link, product_id in deps.product_ids_by_link.items() if product_id in product_ids}
-    return AgentReply(answer, product_ids, product_urls)
+    return AgentReply(answer, product_ids, product_urls, deps.tool_calls)
 
 
 def _build_input(message: str, history: list[AgentMessage]) -> str:
