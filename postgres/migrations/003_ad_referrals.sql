@@ -41,6 +41,13 @@ create index if not exists chat_ad_referrals_source_idx
 create index if not exists chat_ad_referrals_conversation_idx
   on public.chat_ad_referrals (conversation_id);
 
+-- Permisos EXPLÍCITOS, no heredados de las default privileges: acá el SQL editor no corre con
+-- el rol que las tiene configuradas, así que una tabla nueva queda legible pero NO escribible
+-- por service_role. El síntoma es engañoso — GET 200 y POST 404 con cuerpo vacío, sin código
+-- de error de PostgREST. La secuencia va aparte: sin ella el insert falla igual por el bigserial.
+grant select, insert, update, delete on public.chat_ad_referrals to service_role;
+grant usage, select on sequence public.chat_ad_referrals_id_seq to service_role;
+
 
 -- ── Vínculo referral → conversación ────────────────────────────────────────
 -- "El referral pendiente más reciente de este teléfono" necesita order+limit dentro del UPDATE,

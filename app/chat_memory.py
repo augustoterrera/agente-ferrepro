@@ -359,13 +359,18 @@ def cleanup_expired_locks() -> int:
 def link_ad_referral(conversation_id: int, phone: str, max_age_hours: int = 72) -> dict | None:
     """Ata el click en el anuncio (que llegó por el webhook de Meta, keyed por teléfono) a esta
     conversación. Devuelve el referral vinculado, o None si la charla no vino de un aviso."""
-    rows = supabase.rpc(
+    row = supabase.rpc(
         "chat_link_ad_referral",
         {"p_conversation_id": conversation_id, "p_phone": phone, "p_max_age_hours": max_age_hours},
     )
-    if isinstance(rows, list):
-        return rows[0] if rows else None
-    return rows or None
+    if isinstance(row, list):
+        row = row[0] if row else None
+    # Cuando la RPC no engancha nada, PostgREST NO devuelve null: devuelve el composite con todos
+    # los campos en null, que en Python es un dict verdadero. Sin este chequeo, toda charla
+    # orgánica se reportaría como venida de un aviso (verificado contra el Supabase real).
+    if not isinstance(row, dict) or row.get("id") is None:
+        return None
+    return row
 
 
 # ── Estado de la conversación ───────────────────────────────────────────────

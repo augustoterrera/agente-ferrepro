@@ -146,6 +146,18 @@ class VincularConversacion(unittest.TestCase):
         with patch.object(chat_memory.supabase, "rpc", return_value=None):
             chatwoot_service.link_ad_referral(5, {"sender": {"phone_number": "+5493816506312"}})
 
+    def test_composite_vacio_no_cuenta_como_aviso(self) -> None:
+        """PostgREST devuelve el composite con todo en null cuando la RPC no engancha nada — un
+        dict verdadero. Sin filtrarlo, toda charla orgánica se atribuiría a la pauta."""
+        vacio = {"id": None, "phone": None, "source_id": None, "conversation_id": None}
+        with patch.object(chat_memory.supabase, "rpc", return_value=vacio):
+            self.assertIsNone(chat_memory.link_ad_referral(5, "5493816506312"))
+
+    def test_referral_real_se_devuelve(self) -> None:
+        lleno = {"id": 7, "phone": "5493816506312", "source_id": "ad-1", "conversation_id": 5}
+        with patch.object(chat_memory.supabase, "rpc", return_value=lleno):
+            self.assertEqual(chat_memory.link_ad_referral(5, "5493816506312"), lleno)
+
     def test_supabase_caido_no_rompe_el_turno(self) -> None:
         with patch.object(chat_memory.supabase, "rpc", side_effect=SupabaseError("boom")):
             chatwoot_service.link_ad_referral(5, {"sender": {"phone_number": "+5493816506312"}})
