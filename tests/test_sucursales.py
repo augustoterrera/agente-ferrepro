@@ -7,6 +7,7 @@ las dos mitades.
 
 from __future__ import annotations
 
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -17,6 +18,37 @@ from app.tasks import chatwoot_tasks as tasks
 
 SUCURSALES = [10, 30, 31]  # Avellaneda, Saenz Peña, Francisco de Aguirre
 BOT = 32
+
+
+class ConfigDesdeElEntorno(unittest.TestCase):
+    """Lee la config como la lee producción: desde variables de entorno.
+
+    Construir Settings(campo=...) a mano NO sirve como prueba: pydantic-settings hace
+    json.loads sobre el valor de la env antes de los validadores, y ese camino solo se
+    recorre con la env puesta. Sin este test, "10,30,31" tira SettingsError y el proceso
+    no arranca — pasó en producción.
+    """
+
+    def _settings(self, **env):
+        from app.config import Settings
+
+        with patch.dict(os.environ, env, clear=False):
+            return Settings(_env_file=None)
+
+    def test_lee_la_lista_separada_por_comas(self) -> None:
+        s = self._settings(CHATWOOT_SUCURSAL_AGENT_IDS="10,30,31", CHATWOOT_BOT_AGENT_ID="32")
+        self.assertEqual(s.chatwoot_sucursal_agent_ids, [10, 30, 31])
+        self.assertEqual(s.chatwoot_bot_agent_id, 32)
+
+    def test_tolera_espacios(self) -> None:
+        self.assertEqual(
+            self._settings(CHATWOOT_SUCURSAL_AGENT_IDS="10, 30, 31").chatwoot_sucursal_agent_ids,
+            [10, 30, 31],
+        )
+
+    def test_vacia_o_ausente_no_rompe_el_arranque(self) -> None:
+        self.assertEqual(self._settings(CHATWOOT_SUCURSAL_AGENT_IDS="").chatwoot_sucursal_agent_ids, [])
+        self.assertEqual(self._settings().chatwoot_sucursal_agent_ids, [])
 
 
 class Reparto(unittest.TestCase):

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -49,7 +49,10 @@ class Settings(BaseSettings):
     # (round-robin) y la vigilancia de intromisiones mira SOLO a estas: los administradores
     # supervisan, así que es legítimo que contesten donde quieran.
     # Formato en .env: CHATWOOT_SUCURSAL_AGENT_IDS=10,30,31
-    chatwoot_sucursal_agent_ids: list[int] = []
+    # NoDecode es obligatorio: para un tipo compuesto, pydantic-settings intenta json.loads
+    # sobre el valor de la env ANTES de correr los validadores, y "10,30,31" no es JSON →
+    # SettingsError y el proceso no arranca. Con NoDecode el string crudo llega al validador.
+    chatwoot_sucursal_agent_ids: Annotated[list[int], NoDecode] = []
     # Usuario del bot en Chatwoot. Sus mensajes salientes nunca son intromisión.
     chatwoot_bot_agent_id: int | None = None
     chatwoot_access_token: str | None = None
