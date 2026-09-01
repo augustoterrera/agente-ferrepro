@@ -13,6 +13,7 @@ from . import meta, notifier
 from .chatwoot import (
     ChatwootError,
     conversation_labels,
+    detect_agent_intrusion,
     extract_message_event,
     parse_chatwoot_payload,
     verify_chatwoot_signature,
@@ -93,6 +94,38 @@ async def meta_webhook(request: Request) -> dict[str, object]:
     return {"ok": True, "orders": orders}
 
 
+async def _alertar_si_hay_intromision(payload: dict) -> None:
+    """Nunca puede romper la atención al cliente: va envuelta y solo emite una alerta."""
+    try:
+        intrusion = detect_agent_intrusion(
+            payload, settings.chatwoot_sucursal_agent_ids, settings.chatwoot_bot_agent_id
+        )
+        if intrusion is None:
+            return
+        if intrusion.motivo == "sin_asignar":
+            titulo = "Una sucursal contestó una conversación sin asignar"
+            contexto = {
+                "sucursal": f"{intrusion.sender_name} (id {intrusion.sender_id})",
+                "conversación": intrusion.conversation_id,
+                "detalle": "no estaba derivada a nadie: la atendía el bot",
+            }
+        else:
+            titulo = "Una sucursal contestó una conversación de otra"
+            contexto = {
+                "contestó": f"{intrusion.sender_name} (id {intrusion.sender_id})",
+                "asignada a": f"{intrusion.assignee_name} (id {intrusion.assignee_id})",
+                "conversación": intrusion.conversation_id,
+            }
+        logger.warning(
+            "agent_intrusion",
+            extra={"conversation_id": intrusion.conversation_id, "motivo": intrusion.motivo},
+        )
+        # A threadpool: mandar la alerta es E/S bloqueante y no debe frenar el event loop.
+        await run_in_threadpool(notifier.notify_warning, titulo, contexto)
+    except Exception:
+        logger.exception("alerta_de_intromision_fallo")
+
+
 @app.post("/webhooks/chatwoot")
 async def chatwoot_webhook(request: Request) -> dict[str, object]:
     raw_body = await request.body()
@@ -116,6 +149,10 @@ async def chatwoot_webhook(request: Request) -> dict[str, object]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if event is None:
+        # Los mensajes de los agentes caen acá (no son "incoming"). Chatwoot Community no puede
+        # ocultar conversaciones —los roles custom son de pago—, así que lo que no se puede
+        # prevenir se audita: si una sucursal contesta lo que no le toca, avisamos.
+        await _alertar_si_hay_intromision(payload)
         return {"ok": True, "handled": False, "reason": ignore_reason}
 
     # Gate de humano: si la conversación tiene bot_apagado (lo pone un humano en Chatwoot),

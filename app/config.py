@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -41,7 +42,16 @@ class Settings(BaseSettings):
     # Chatwoot (transporte)
     chatwoot_url: str | None = None
     chatwoot_account_id: int | None = None
+    # Fallback histórico: a quién derivar si no hay sucursales configuradas. Con
+    # chatwoot_sucursal_agent_ids cargado no se usa.
     chatwoot_assignee_id: int | None = None
+    # Sucursales que atienden las derivaciones, en orden. El handoff reparte entre ellas
+    # (round-robin) y la vigilancia de intromisiones mira SOLO a estas: los administradores
+    # supervisan, así que es legítimo que contesten donde quieran.
+    # Formato en .env: CHATWOOT_SUCURSAL_AGENT_IDS=10,30,31
+    chatwoot_sucursal_agent_ids: list[int] = []
+    # Usuario del bot en Chatwoot. Sus mensajes salientes nunca son intromisión.
+    chatwoot_bot_agent_id: int | None = None
     chatwoot_access_token: str | None = None
     chatwoot_webhook_secret: str | None = None
     chatwoot_webhook_timestamp_tolerance_seconds: int = 300
@@ -118,6 +128,15 @@ class Settings(BaseSettings):
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     alert_project: str = "agente-ferrepro"
+
+    @field_validator("chatwoot_sucursal_agent_ids", mode="before")
+    @classmethod
+    def _parse_agent_ids(cls, value: Any) -> Any:
+        """Acepta "10,30,31" además del JSON que pydantic espera para una lista: la env la
+        escribe una persona en el .env, no un serializador."""
+        if isinstance(value, str):
+            return [int(part) for part in value.replace(" ", "").split(",") if part]
+        return value
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
 

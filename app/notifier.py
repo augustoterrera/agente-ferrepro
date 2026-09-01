@@ -53,6 +53,16 @@ def notify_error(titulo: str, detalle: object = None, contexto: dict | None = No
     return send("\n".join(lineas))
 
 
+def notify_warning(titulo: str, contexto: dict | None = None) -> bool:
+    """Aviso operativo, no una falla del sistema. Se distingue del 🔴 a propósito: si todo
+    alerta igual, deja de mirarse."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    lineas = [f"\u26a0\ufe0f <b>{_esc(settings.alert_project)}</b> — {_esc(titulo)}", f"<i>{ts}</i>"]
+    for key, value in (contexto or {}).items():
+        lineas.append(f"• <b>{_esc(key)}:</b> {_esc(value)}")
+    return send("\n".join(lineas))
+
+
 if __name__ == "__main__":
     import sys
 

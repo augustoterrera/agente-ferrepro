@@ -216,6 +216,87 @@ def extract_message_event(payload: dict[str, Any], history_limit: int = 16) -> t
     )
 
 
+# ── Reparto de derivaciones ─────────────────────────────────────────────────
+def pick_sucursal(
+    conversation_id: object, sucursal_ids: list[int], fallback: int | None = None
+) -> int | None:
+    """Elige a qué sucursal derivar, repartiendo parejo.
+
+    Los ids de conversación de Chatwoot son incrementales, así que el módulo ES un round-robin
+    real y encima no necesita estado compartido entre workers. Además es estable: si el handoff
+    se reintenta, la conversación cae en la misma sucursal en vez de saltar a otra.
+    """
+    if not sucursal_ids:
+        return fallback
+    try:
+        indice = int(str(conversation_id))
+    except (TypeError, ValueError):
+        # Sin id usable no hay reparto posible; mejor una sucursal fija que no derivar.
+        return sucursal_ids[0]
+    return sucursal_ids[indice % len(sucursal_ids)]
+
+
+# ── Vigilancia de intromisiones ─────────────────────────────────────────────
+@dataclass(frozen=True)
+class AgentIntrusion:
+    """Una sucursal contestó algo que no le tocaba."""
+
+    conversation_id: str
+    sender_id: int
+    sender_name: str
+    motivo: str  # "sin_asignar" | "asignada_a_otro"
+    assignee_id: int | None = None
+    assignee_name: str | None = None
+
+
+def detect_agent_intrusion(
+    payload: dict[str, Any], sucursal_ids: list[int], bot_agent_id: int | None = None
+) -> AgentIntrusion | None:
+    """Chatwoot Community no puede ocultar conversaciones: todos los agentes ven todo. Como no
+    se puede prevenir, se detecta. Mira SOLO a las sucursales — los administradores supervisan
+    y el bot escribe en todas, así que incluirlos sería puro ruido.
+    """
+    # Sin saber quién es el bot no se puede vigilar: el bot escribe en todas las conversaciones
+    # y su usuario puede estar en la lista de sucursales (pasa mientras se migra el token). Sin
+    # este corte, cada mensaje del bot sería una acusación falsa contra una sucursal.
+    if not sucursal_ids or bot_agent_id is None:
+        return None
+    if str(payload.get("event") or "") != "message_created":
+        return None
+    if str(payload.get("message_type") or "") != "outgoing":
+        return None
+    # Las notas privadas no las ve el cliente: coordinar por ahí no es meterse en la charla.
+    if bool(payload.get("private")):
+        return None
+
+    sender = payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
+    sender_id = sender.get("id")
+    if not isinstance(sender_id, int) or sender_id == bot_agent_id or sender_id not in sucursal_ids:
+        return None
+
+    conversation = payload.get("conversation") if isinstance(payload.get("conversation"), dict) else {}
+    meta = conversation.get("meta") if isinstance(conversation.get("meta"), dict) else {}
+    assignee = meta.get("assignee") if isinstance(meta.get("assignee"), dict) else {}
+    assignee_id = assignee.get("id")
+    conversation_id = str(conversation.get("id") or payload.get("conversation_id") or "")
+    sender_name = str(sender.get("name") or f"agente {sender_id}")
+
+    if assignee_id == sender_id:
+        return None
+    if assignee_id is None:
+        # Sin asignar = la está atendiendo el bot. Meterse ahí es el caso que más molesta:
+        # contestan sin que nadie se las haya derivado.
+        return AgentIntrusion(conversation_id, sender_id, sender_name, "sin_asignar")
+    return AgentIntrusion(
+        conversation_id,
+        sender_id,
+        sender_name,
+        "asignada_a_otro",
+        assignee_id=int(assignee_id),
+        assignee_name=str(assignee.get("name") or f"agente {assignee_id}"),
+    )
+
+
 def extract_history(payload: dict[str, Any], limit: int) -> list[AgentMessage]:
     conversation = payload.get("conversation") if isinstance(payload.get("conversation"), dict) else {}
     messages = conversation.get("messages") if isinstance(conversation.get("messages"), list) else []

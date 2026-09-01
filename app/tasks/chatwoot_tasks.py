@@ -16,6 +16,7 @@ from app.chatwoot import (
     build_chatwoot_client,
     catalog_private_note,
     detect_handoff_flags,
+    pick_sucursal,
     should_handoff_to_agent,
 )
 from app.chatwoot_service import process_pending_conversation_messages, sync_crm_labels
@@ -51,8 +52,15 @@ def _handoff_if_needed(client, account_id, conv, content: str) -> bool:
         if label not in labels:
             labels.append(label)
     applied = client.set_conversation_labels(account_id, conv.external_conversation_id, labels)
-    if settings.chatwoot_assignee_id is not None:
-        client.assign_conversation(account_id, conv.external_conversation_id, settings.chatwoot_assignee_id)
+    # Reparto parejo entre sucursales. Si la lista está vacía cae al assignee fijo de antes,
+    # así un deploy a medio configurar no deja la derivación sin dueño.
+    sucursal_id = pick_sucursal(
+        conv.external_conversation_id,
+        settings.chatwoot_sucursal_agent_ids,
+        fallback=settings.chatwoot_assignee_id,
+    )
+    if sucursal_id is not None:
+        client.assign_conversation(account_id, conv.external_conversation_id, sucursal_id)
     # Espejamos en el CRM el set final de labels para que el dashboard no quede desincronizado.
     sync_crm_labels(conv.external_conversation_id, applied or labels)
     return True

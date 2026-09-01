@@ -3,6 +3,10 @@
 .env.*
 !.env.example
 
+# Credenciales locales (NUNCA al repo)
+CREDENCIALES.md
+*.local.md
+
 # Python
 __pycache__/
 *.py[cod]
