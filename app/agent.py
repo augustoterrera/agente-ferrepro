@@ -179,7 +179,11 @@ def run_agent_reply(
     repeat_links = _asks_to_repeat(message)
     deps = Deps(
         current_message=message,
-        shown_links=history_links if repeat_links else set(),
+        # Los links ya mostrados quedan SIEMPRE permitidos: salieron de una búsqueda real en un
+        # turno anterior, así que repetirlos no es inventar. Hace falta para que el llamado a la
+        # acción ("comprá desde este link") llegue con el link puesto en vez de mandar al cliente
+        # a scrollear. Cuándo repetirlo lo decide el prompt; el guard solo deja de estorbar.
+        shown_links=set(history_links),
         seen_links=set() if repeat_links else history_links,
     )
     text = _build_input(message, history)

@@ -40,6 +40,27 @@ def _chatwoot_client_for(conv):
     return client, account_id
 
 
+def _dispatch_classify(conversation_id: str | None) -> None:
+    """Se despacha DESPUÉS del handoff, nunca en paralelo.
+
+    El clasificador reescribe el set completo de etiquetas (la API de Chatwoot no sabe hacer
+    merge): lee, calcula y pisa. Si corría a la vez que el handoff, leía las etiquetas ANTES de
+    que se agregara `bot_apagado` y al guardar se lo llevaba puesto — el bot quedaba prendido en
+    una conversación ya derivada y le hablaba al cliente por encima de la sucursal. Visto en
+    producción: "agregó bot_apagado" y "eliminó bot_apagado" en el mismo segundo.
+    """
+    if conversation_id:
+        classify_and_label_conversation.apply_async((str(conversation_id),), queue="chatwoot_outbound")
+
+
+# Se llama en TODOS los finales de send_chatwoot_outbound_message, no solo en los exitosos: antes
+# del acople la clasificación corría por su cuenta y no dependía del envío. Si solo se despachara
+# al enviar bien, una falla definitiva dejaría la conversación sin etapa ni flags —y el
+# retargeting, que filtra por esas etapas, no la vería nunca más—.
+# Excepciones a propósito: `already_claimed` (lo despacha el worker que sí tiene el lock, si no
+# se clasificaría dos veces) y los `self.retry` (la task vuelve a correr).
+
+
 def _handoff_if_needed(client, account_id, conv, content: str) -> bool:
     if not should_handoff_to_agent(content):
         return False
@@ -185,11 +206,12 @@ def process_chatwoot_conversation(self, conversation_id: str) -> dict[str, objec
             outbox_id = processed[0] if processed else None
             if processed is not None:
                 outbox_id, should_classify = processed
-                send_chatwoot_outbound_message.apply_async((str(outbox_id),), queue="chatwoot_outbound")
-                # Clasificar y etiquetar la conversación (async, no frena el reply). Corre también
-                # en handoff para no perder etapa/flags si la derivación apaga el bot.
-                if should_classify:
-                    classify_and_label_conversation.apply_async((str(conversation_id),), queue="chatwoot_outbound")
+                # La clasificación viaja CON el envío para que corra después del handoff, no a la
+                # par: si compiten, el clasificador pisa el `bot_apagado` que pone la derivación.
+                send_chatwoot_outbound_message.apply_async(
+                    (str(outbox_id), str(conversation_id) if should_classify else None),
+                    queue="chatwoot_outbound",
+                )
             return {"ok": True, "conversation_id": conversation_id, "outbox_id": outbox_id}
         except Exception as exc:
             status = "failed" if self.request.retries >= settings.chatwoot_job_max_retries else "retry"
@@ -209,9 +231,10 @@ def process_chatwoot_conversation(self, conversation_id: str) -> dict[str, objec
     retry_jitter=True,
     max_retries=settings.chatwoot_outbox_max_retries,
 )
-def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
+def send_chatwoot_outbound_message(self, outbox_id: str, classify_conversation_id: str | None = None) -> dict[str, object]:
     outbox = chat_memory.get_outbox(int(outbox_id))
     if outbox is None:
+        _dispatch_classify(classify_conversation_id)
         return {"ok": False, "outbox_id": outbox_id, "status": "not_found"}
     if outbox["status"] in ("sent", "failed", "cancelled"):
         if outbox["status"] == "sent":
@@ -219,6 +242,7 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
             client, account_id = _chatwoot_client_for(conv)
             if client and account_id:
                 _handoff_if_needed(client, account_id, conv, outbox["content"])
+        _dispatch_classify(classify_conversation_id)
         return {"ok": outbox["status"] == "sent", "outbox_id": outbox_id, "status": f"already_{outbox['status']}"}
 
     previous_status = str(outbox["status"])
@@ -231,6 +255,7 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
     if client is None or account_id is None:
         status = chat_memory.mark_outbox_retry_or_failed(int(outbox_id), "Chatwoot no configurado")
         if status == "failed":
+            _dispatch_classify(classify_conversation_id)
             return {"ok": False, "outbox_id": outbox_id, "status": "failed"}
         raise self.retry(countdown=settings.chatwoot_debounce_retry_seconds)
 
@@ -257,6 +282,7 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
             # chequeo contra el intake; si retomó, el follow-up pendiente se cancela.
             if is_retargeting and chat_memory.cancel_retargeting_if_resumed(int(outbox_id)):
                 logger.info("retargeting_cancelado_por_respuesta", extra={"outbox_id": outbox_id})
+                _dispatch_classify(classify_conversation_id)
                 return {"ok": True, "outbox_id": outbox_id, "status": "cancelled"}
             meta_response = None
             catalog_already_delivered = False
@@ -330,6 +356,7 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
                 if status == "sent"
                 else False
             )
+            _dispatch_classify(classify_conversation_id)
             return {
                 "ok": status == "sent",
                 "outbox_id": outbox_id,
@@ -337,9 +364,11 @@ def send_chatwoot_outbound_message(self, outbox_id: str) -> dict[str, object]:
                 "handoff": handoff,
             }
         if status == "failed":
+            _dispatch_classify(classify_conversation_id)
             raise
         raise self.retry(exc=exc)
     handoff = _handoff_if_needed(client, account_id, conv, outbox["content"])
+    _dispatch_classify(classify_conversation_id)
     return {"ok": True, "outbox_id": outbox_id, "status": "sent", "handoff": handoff}
 
 
@@ -501,7 +530,10 @@ def dispatch_pending_outbox_messages() -> dict[str, object]:
         stale_minutes=settings.chatwoot_stale_processing_minutes,
     )
     for row in rows:
-        send_chatwoot_outbound_message.apply_async((str(row["id"]),), queue="chatwoot_outbound")
+        send_chatwoot_outbound_message.apply_async(
+            (str(row["id"]), str(row["conversation_id"]) if row.get("conversation_id") else None),
+            queue="chatwoot_outbound",
+        )
     return {"ok": True, "dispatched": len(rows)}
 
 
