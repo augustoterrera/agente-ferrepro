@@ -271,7 +271,13 @@ class RetargetingChecks(unittest.TestCase):
     def test_envio_catalogo_usa_content_id_de_variante(self) -> None:
         outbox = {
             "id": 1,
-            "content": "Taladro con precio y link",
+            "content": (
+                "Taladro Percutor 700W 13Mm Braber\n"
+                "Precio: $55.152\n"
+                "🔗 https://www.ferreproindustrial.com/productos/taladro-percutor-700w-13mm-braber-tp1370-1tkdd\n\n"
+                "Podés comprarlo desde ahí. Si preferís pasar por sucursal y pagar en efectivo, tenés 10% de descuento.\n\n"
+                "¿Querés que te derive con un vendedor para ayudarte con la compra o el envío?"
+            ),
             "raw_payload": {"customer_phone": "5493815551234", "meta_product_product_ids": [350971067]},
         }
         sent: list[dict] = []
@@ -293,6 +299,78 @@ class RetargetingChecks(unittest.TestCase):
 
         self.assertEqual(response, {"messages": [{"id": "wamid.test"}]})
         self.assertEqual(sent[0]["interactive"]["action"]["product_retailer_id"], "1544613986")
+        self.assertEqual(sent[0]["interactive"]["body"]["text"], "Te dejo el producto para verlo en WhatsApp")
+        self.assertIn("10% de descuento", plan["remaining_text"])
+        self.assertIn("¿Querés que te derive", plan["remaining_text"])
+
+    def test_followup_de_catalogo_saca_bloque_repetido_y_conserva_cierre(self) -> None:
+        content = (
+            "Taladro Percutor 700W 13Mm Braber\n"
+            "Precio: $55.152\n"
+            "🔗 https://www.ferreproindustrial.com/productos/taladro-percutor-700w-13mm-braber-tp1370-1tkdd\n\n"
+            "Podés comprarlo desde ahí. Si preferís pasar por sucursal y pagar en efectivo, tenés 10% de descuento.\n\n"
+            "¿Querés que te derive con un vendedor para ayudarte con la compra o el envío?"
+        )
+
+        body = tasks._catalog_followup_text(content, 1)
+
+        self.assertNotIn("Taladro Percutor", body)
+        self.assertNotIn("https://", body)
+        self.assertIn("10% de descuento", body)
+        self.assertIn("ayudarte con la compra o el envío", body)
+
+    def test_followup_de_catalogo_no_duplica_cierre_si_hay_productos_por_texto(self) -> None:
+        remaining = (
+            "También tenemos estas opciones 👇\n\n"
+            "Producto sin catálogo\n"
+            "Precio: $10\n"
+            "🔗 https://www.ferreproindustrial.com/productos/producto-sin-catalogo\n\n"
+            "¿Querés que te derive con un vendedor para ayudarte con la compra o el envío?"
+        )
+        followup = "¿Querés que te derive con un vendedor para ayudarte con la compra o el envío?"
+
+        body = tasks._join_public_catalog_text(remaining, followup)
+
+        self.assertEqual(body, remaining)
+
+    def test_catalogo_exitoso_manda_card_y_despues_mensaje_vendedor(self) -> None:
+        outbox = {
+            "id": 1, "conversation_id": 5, "external_conversation_id": "8", "status": "pending",
+            "content": "Producto con precio y link", "attempts": 0, "idempotency_key": "chatwoot:8:x",
+            "created_at": "2026-08-04T09:00:00+00:00",
+        }
+        posts: list[tuple[str, bool]] = []
+
+        class _Client:
+            def create_outgoing_message(self, _a, _c, content, *, private=False):
+                posts.append((content, private))
+                return {"id": len(posts), "private": private}
+
+        with (
+            patch.object(tasks.chat_memory, "get_outbox", return_value=outbox),
+            patch.object(tasks.chat_memory, "mark_outbox_processing", return_value=True),
+            patch.object(tasks.chat_memory, "get_conversation", return_value=Conversation(5, "chatwoot", "8", "6")),
+            patch.object(tasks.chat_memory, "mark_outbox_sent"),
+            patch.object(tasks, "build_chatwoot_client", return_value=_Client()),
+            patch.object(
+                tasks,
+                "_meta_product_plan",
+                return_value={
+                    "payload": {},
+                    "catalog_product_ids": [352305267],
+                    "catalog_text": "Producto con precio y link",
+                    "remaining_text": "¿Querés que te derive con un vendedor de FerrePro?",
+                },
+            ),
+            patch.object(tasks, "_send_meta_product_plan", return_value={"messages": [{"id": "wamid.test"}]}),
+            patch.object(tasks, "_handoff_if_needed", return_value=False),
+        ):
+            tasks.send_chatwoot_outbound_message("1")
+
+        self.assertEqual(len(posts), 2)
+        self.assertTrue(posts[0][1])
+        self.assertIn("Muestra de lo enviado", posts[0][0])
+        self.assertEqual(posts[1], ("¿Querés que te derive con un vendedor de FerrePro?", False))
 
     def test_catalogo_solo_usa_productos_aprobados_para_whatsapp(self) -> None:
         response = io.BytesIO(

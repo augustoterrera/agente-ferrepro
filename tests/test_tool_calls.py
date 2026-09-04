@@ -141,7 +141,7 @@ class ProductoReferidoPorPauta(unittest.TestCase):
         select.assert_called_once()
         self.assertIn("id=eq.350860225", select.call_args.args[1])
         self.assertIn("Precio: $50.754", reply.text)
-        self.assertIn("Podés comprarlo directo desde ese link", reply.text)
+        self.assertIn("Podés comprarlo desde ahí", reply.text)
         self.assertEqual(reply.product_ids, [350860225])
         self.assertEqual(reply.tool_calls[0]["tool"], "product_ref")
         self.assertTrue(reply.tool_calls[0]["encontrado"])

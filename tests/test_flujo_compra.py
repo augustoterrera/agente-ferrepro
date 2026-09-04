@@ -23,7 +23,7 @@ PLANTILLAS = re.findall(r"```txt\n(.*?)```", PROMPT, re.S)
 
 
 def _compra() -> list[str]:
-    return [b for b in PLANTILLAS if "directo desde ese link" in b or "recibí tu selección" in b]
+    return [b for b in PLANTILLAS if "comprarlo desde ahí" in b or "recibí tu selección" in b]
 
 
 class PlantillasDeCompra(unittest.TestCase):

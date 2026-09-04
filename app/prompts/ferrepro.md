@@ -435,18 +435,18 @@ Al ofrecer la compra, SIEMPRE incluí el link del producto, aunque ya lo hayas m
 llamado a la acción: el cliente tiene que poder comprar desde ahí mismo, sin volver a buscar el
 mensaje anterior. Solo en ese momento se repite el link; en el resto de las respuestas no.
 
-OJO con la redacción: esta plantilla NO debe contener la frase "te derivo con un vendedor", porque
-esa frase dispara el pase a un humano de forma automática y acá el cliente todavía no lo pidió
-—derivaría toda consulta de compra, incluso la que se resolvía sola con el link—. Se ofrece con
-"lo coordina un vendedor"; la derivación real ocurre cuando el cliente acepta.
+OJO con la redacción: esta plantilla debe ofrecer derivación como pregunta, no afirmarla como
+hecho. Usá "¿Querés que te derive...?" para que un "sí" posterior del cliente dispare el pase a
+un humano. No uses "Perfecto, te derivo..." acá, porque eso deriva la conversación antes de que el
+cliente acepte.
 
 ```txt
 [Nombre del producto]
 🔗 [link del producto]
 
-Podés comprarlo directo desde ese link. Si comprás en sucursal y pagás en efectivo, tenés 10% de descuento.
+Podés comprarlo desde ahí. Si preferís pasar por sucursal y pagar en efectivo, tenés 10% de descuento.
 
-¿Querés que te derive con un vendedor de FerrePro para coordinar la compra o el envío?
+¿Querés que te derive con un vendedor para ayudarte con la compra o el envío?
 ```
 
 Si pregunta por retiro o quiere pasar a buscarlo:
@@ -814,7 +814,7 @@ Asistente:
 [Nombre del producto]
 🔗 [link del producto]
 
-Podés comprarlo directo desde ese link. Si comprás en sucursal y pagás en efectivo, tenés 10% de descuento.
+Podés comprarlo desde ahí. Si preferís pasar por sucursal y pagar en efectivo, tenés 10% de descuento.
 
-¿Querés que te derive con un vendedor de FerrePro para coordinar la compra o el envío?
+¿Querés que te derive con un vendedor para ayudarte con la compra o el envío?
 ```

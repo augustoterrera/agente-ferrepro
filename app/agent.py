@@ -402,9 +402,9 @@ def _product_ref_direct_reply(product: dict[str, Any], deps: Deps) -> AgentReply
 
     lines += [
         "",
-        "Podés comprarlo directo desde ese link. Si comprás en sucursal y pagás en efectivo, tenés 10% de descuento.",
+        "Podés comprarlo desde ahí. Si preferís pasar por sucursal y pagar en efectivo, tenés 10% de descuento.",
         "",
-        "¿Querés que te derive con un vendedor de FerrePro para coordinar la compra o el envío?",
+        "¿Querés que te derive con un vendedor para ayudarte con la compra o el envío?",
     ]
     product_urls = {product_id: link} if link else {}
     return AgentReply("\n".join(lines), [product_id], product_urls, deps.tool_calls)

@@ -406,6 +406,8 @@ def _meta_product_plan(outbox: dict) -> dict[str, object] | None:
                 return None
             catalog_text, remaining_text = split
         retailer_ids = [retailer_by_product[product_id] for product_id in catalog_product_ids]
+        followup_text = _catalog_followup_text(catalog_text, len(retailer_ids))
+        remaining_text = _join_public_catalog_text(remaining_text, followup_text)
         payload = (
             product_list_payload(phone, retailer_ids, body="Te dejo los productos para verlos en WhatsApp")
             if len(retailer_ids) > 1
@@ -428,6 +430,38 @@ def _send_meta_product_plan(plan: dict[str, object], outbox_id: object = None) -
     except MetaError as exc:
         logger.warning("meta_catalog_message_failed", extra={"outbox_id": outbox_id, "error": str(exc)})
         return {"error": str(exc)[:500]}
+
+
+def _catalog_followup_text(catalog_text: str, product_count: int) -> str:
+    """Mensaje público que se manda después de la tarjeta/lista nativa de WhatsApp."""
+    blocks = [block.strip() for block in catalog_text.split("\n\n") if block.strip()]
+    useful_blocks = [
+        block
+        for block in blocks
+        if "https://www.ferreproindustrial.com/productos/" not in block
+        and not block.lower().startswith("mirá estas opciones")
+    ]
+    text = "\n\n".join(useful_blocks).strip()
+    if text:
+        return text[:1024]
+    return (
+        "Ahí te dejé las opciones. Si preferís comprar en sucursal y pagar en efectivo, tenés 10% de descuento.\n\n"
+        "¿Querés que te derive con un vendedor para ayudarte con la compra o el envío?"
+        if product_count > 1
+        else "Ahí lo tenés. Si preferís comprar en sucursal y pagar en efectivo, tenés 10% de descuento.\n\n"
+        "¿Querés que te derive con un vendedor para ayudarte con la compra o el envío?"
+    )
+
+
+def _join_public_catalog_text(remaining_text: str | None, followup_text: str) -> str | None:
+    parts: list[str] = []
+    for part in [remaining_text, followup_text]:
+        clean = part.strip() if part else ""
+        if not clean or any(clean == existing or clean in existing for existing in parts):
+            continue
+        parts = [existing for existing in parts if existing not in clean]
+        parts.append(clean)
+    return "\n\n".join(parts) if parts else None
 
 
 def _split_catalog_content(
