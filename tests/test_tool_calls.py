@@ -128,42 +128,28 @@ class ProductoReferidoPorPauta(unittest.TestCase):
             "category_names": ["HERRAMIENTAS A BATERIA"],
         }
 
-    def test_ref_fp_id_inyecta_producto_exacto_en_el_prompt(self) -> None:
-        link = "https://www.ferreproindustrial.com/productos/taladro-ator-12v-20nm-1bat-usb-emtop-ecdl12456"
-
-        class _Corrida:
-            output = f"EMTOP · Taladro Ator 12V 20Nm\nPrecio: $50.754\n🔗 {link}"
-
-        agente = MagicMock()
-        agente.run_sync.return_value = _Corrida()
+    def test_ref_fp_id_responde_producto_exacto_sin_llm(self) -> None:
         with (
-            patch.object(agent_mod, "decide_scope", return_value=ScopeDecision("in_scope")),
-            patch.object(agent_mod, "build_agent", return_value=agente),
+            patch.object(agent_mod, "decide_scope") as scope,
+            patch.object(agent_mod, "build_agent") as build,
             patch.object(agent_mod, "sb_select", return_value=[self._producto()]) as select,
         ):
             reply = agent_mod.run_agent_reply("Hola, quiero info. Ref: FP-350860225", [])
 
-        prompt = agente.run_sync.call_args.args[0]
+        scope.assert_not_called()
+        build.assert_not_called()
         select.assert_called_once()
         self.assertIn("id=eq.350860225", select.call_args.args[1])
-        self.assertIn("Producto referido por pauta/publicidad", prompt)
-        self.assertIn("Ref: FP-350860225", prompt)
-        self.assertIn("Precio vigente: $50.754", prompt)
+        self.assertIn("Precio: $50.754", reply.text)
+        self.assertIn("Podés comprarlo directo desde ese link", reply.text)
         self.assertEqual(reply.product_ids, [350860225])
         self.assertEqual(reply.tool_calls[0]["tool"], "product_ref")
         self.assertTrue(reply.tool_calls[0]["encontrado"])
 
     def test_codigo_valido_no_cae_en_scope_ambiguo(self) -> None:
-        link = "https://www.ferreproindustrial.com/productos/taladro-ator-12v-20nm-1bat-usb-emtop-ecdl12456"
-
-        class _Corrida:
-            output = f"EMTOP · Taladro Ator 12V 20Nm\nPrecio: $50.754\n🔗 {link}"
-
-        agente = MagicMock()
-        agente.run_sync.return_value = _Corrida()
         with (
             patch.object(agent_mod, "decide_scope") as scope,
-            patch.object(agent_mod, "build_agent", return_value=agente),
+            patch.object(agent_mod, "build_agent") as build,
             patch.object(
                 agent_mod,
                 "sb_select",
@@ -173,8 +159,30 @@ class ProductoReferidoPorPauta(unittest.TestCase):
             reply = agent_mod.run_agent_reply("Hola! Quiero info del producto del anuncio. Código: 1otsu", [])
 
         scope.assert_not_called()
+        build.assert_not_called()
         self.assertNotIn("confirmás qué producto", reply.text)
         self.assertEqual(reply.tool_calls[0]["tipo"], "handle_suffix")
+
+    def test_codigo_gana_aunque_el_nombre_escrito_no_coincida(self) -> None:
+        taladro = self._producto() | {
+            "id": 350988299,
+            "name": "Taladro Percutor 700W 13Mm Braber",
+            "brand": "BRABER",
+            "handle": "taladro-percutor-700w-13mm-braber-tp1370-1tkdd",
+            "canonical_url": "https://www.ferreproindustrial.com/productos/taladro-percutor-700w-13mm-braber-tp1370-1tkdd/",
+            "price_min": 55151.8,
+            "price_max": 55151.8,
+        }
+        with (
+            patch.object(agent_mod, "build_agent") as build,
+            patch.object(agent_mod, "sb_select", return_value=[taladro]),
+        ):
+            reply = agent_mod.run_agent_reply("Hola! Quiero info sobre APILADOR HIDRAULICO 2TN X 2MTS. Código: 1tkdd", [])
+
+        build.assert_not_called()
+        self.assertIn("Taladro Percutor", reply.text)
+        self.assertNotIn("APILADOR HIDRAULICO", reply.text)
+        self.assertEqual(reply.product_ids, [350988299])
 
     def test_codigo_en_historial_sirve_para_respuestas_cortas(self) -> None:
         link = "https://www.ferreproindustrial.com/productos/taladro-ator-12v-20nm-1bat-usb-emtop-ecdl12456"

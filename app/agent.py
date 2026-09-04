@@ -179,6 +179,10 @@ def run_agent_reply(
         shown_links=set(history_links),
         seen_links=set() if repeat_links else history_links,
     )
+    current_ref_product = _product_ref_product(message, [], deps)
+    if current_ref_product:
+        return _product_ref_direct_reply(current_ref_product, deps)
+
     product_ref_context = _product_ref_context(message, history, deps)
     fast_scope = deterministic_scope(message)
     if fast_scope is not None and fast_scope.status == "out_of_scope":
@@ -284,6 +288,11 @@ def _norm_url(url: str | None) -> str:
 
 
 def _product_ref_context(message: str, history: list[AgentMessage], deps: Deps) -> str | None:
+    product = _product_ref_product(message, history, deps)
+    return _format_product_ref_context(product) if product else None
+
+
+def _product_ref_product(message: str, history: list[AgentMessage], deps: Deps) -> dict[str, Any] | None:
     for kind, value in _product_ref_candidates(message, history):
         product = _product_by_reference(kind, value)
         if not product:
@@ -297,7 +306,7 @@ def _product_ref_context(message: str, history: list[AgentMessage], deps: Deps) 
         deps.tool_calls.append(
             {"tool": "product_ref", "tipo": kind, "valor": value, "encontrado": True, "product_id": product_id}
         )
-        return _format_product_ref_context(product)
+        return product
     return None
 
 
@@ -367,6 +376,46 @@ def _format_product_ref_context(product: dict[str, Any]) -> str:
         "asumí que habla de este producto. No preguntes qué producto es."
     )
     return "\n".join(lines)
+
+
+def _product_ref_direct_reply(product: dict[str, Any], deps: Deps) -> AgentReply:
+    product_id = int(product["id"])
+    name = _display_product_name(product)
+    link = _norm_url(product.get("canonical_url"))
+    price = format_price(
+        _float_or_none(product.get("price_min")),
+        _float_or_none(product.get("price_max")),
+    )
+    lines = [name]
+    if price:
+        lines.append(f"Precio: {price}")
+    if link:
+        lines.append(f"🔗 {link}")
+
+    if not product.get("in_stock"):
+        lines += [
+            "",
+            "Lo tenemos identificado, pero está sin stock por ahora.",
+            "¿Querés que te derive con un vendedor de FerrePro para avisarte cuando vuelva a entrar?",
+        ]
+        return AgentReply("\n".join(lines), [], tool_calls=deps.tool_calls)
+
+    lines += [
+        "",
+        "Podés comprarlo directo desde ese link. Si comprás en sucursal y pagás en efectivo, tenés 10% de descuento.",
+        "",
+        "¿Querés que te derive con un vendedor de FerrePro para coordinar la compra o el envío?",
+    ]
+    product_urls = {product_id: link} if link else {}
+    return AgentReply("\n".join(lines), [product_id], product_urls, deps.tool_calls)
+
+
+def _display_product_name(product: dict[str, Any]) -> str:
+    brand = html.unescape(str(product.get("brand") or "")).strip()
+    name = html.unescape(str(product.get("name") or "")).strip()
+    if brand and brand.lower() not in name.lower():
+        return f"{brand} · {name}"
+    return name or brand or f"Producto FP-{product['id']}"
 
 
 def _float_or_none(value: Any) -> float | None:
