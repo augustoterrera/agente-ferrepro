@@ -23,6 +23,13 @@ IN_SCOPE_RE = re.compile(
     r"zorras?|transpaletas?|apiladoras?|escaleras?|seguridad|guantes?|cascos?"
     r")\b"
 )
+PRODUCT_URL_PREFIX = "https://www.ferreproindustrial.com/productos/"
+CONTEXTUAL_PRODUCT_REPLY_RE = re.compile(
+    r"(^|\b)("
+    r"la|el|esa|ese|esta|este|primera|primer|segunda|segundo|tercera|tercero|"
+    r"me interesa|me sirve|quiero esa|quiero ese|llevo esa|llevo ese"
+    r")\b|[$]?\s*\d+(?:[.,]\d+)*"
+)
 OBVIOUS_OUT_OF_SCOPE: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(r"\b(celulares?|celus?|smartphones?|iphone|motorola|xiaomi|galaxy|samsung\s+(?:galaxy|[asje]\d{1,3}))\b"),
@@ -69,11 +76,20 @@ class ScopeDecision:
     product: str | None = None
 
 
-def decide_scope(message: str, history: list[Any] | None = None) -> ScopeDecision:
-    fast = deterministic_scope(message)
+def decide_scope(
+    message: str,
+    history: list[Any] | None = None,
+    *,
+    fast_scope: ScopeDecision | None = None,
+) -> ScopeDecision:
+    history = history or []
+    fast = fast_scope if fast_scope is not None else deterministic_scope(message)
     if fast is not None:
         return fast
-    return llm_scope(message, history or [])
+    contextual = contextual_scope(message, history)
+    if contextual is not None:
+        return contextual
+    return llm_scope(message, history)
 
 
 def deterministic_scope(message: str) -> ScopeDecision | None:
@@ -83,6 +99,21 @@ def deterministic_scope(message: str) -> ScopeDecision | None:
     for pattern, product in OBVIOUS_OUT_OF_SCOPE:
         if pattern.search(text):
             return ScopeDecision("out_of_scope", product)
+    return None
+
+
+def contextual_scope(message: str, history: list[Any]) -> ScopeDecision | None:
+    """Respuestas como "la de 1.600.000" dependen del producto ya mostrado.
+
+    Sin este atajo, el LLM de alcance puede ver solo un precio o pronombre y pedir que confirmen
+    rubro, aunque la charla venga claramente de apiladoras/taladros/etc.
+    """
+    if not history or not CONTEXTUAL_PRODUCT_REPLY_RE.search(_plain(message)):
+        return None
+    for item in reversed(history[-6:]):
+        content = _plain(str(getattr(item, "content", "")))
+        if IN_SCOPE_RE.search(content) or PRODUCT_URL_PREFIX in content:
+            return ScopeDecision("general")
     return None
 
 

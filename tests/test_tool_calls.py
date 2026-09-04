@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import dataclass
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from app import agent as agent_mod
 from app import chatwoot_service
 from app.agent import AgentReply, Deps, build_agent
 from app.chat_memory import Conversation
-from app.models import Product
+from app.models import AgentMessage, Product
 from app.scope import ScopeDecision
 
 
@@ -113,6 +113,144 @@ class ScopeTrace(unittest.TestCase):
         self.assertEqual(
             reply.tool_calls, [{"tool": "scope", "status": "out_of_scope", "producto": "celulares"}]
         )
+
+
+class ProductoReferidoPorPauta(unittest.TestCase):
+    def _producto(self) -> dict:
+        return {
+            "id": 350860225,
+            "name": "Taladro Ator 12V 20Nm 1Bat Usb Emtop Ecdl12456",
+            "brand": "EMTOP",
+            "canonical_url": "https://www.ferreproindustrial.com/productos/taladro-ator-12v-20nm-1bat-usb-emtop-ecdl12456/",
+            "price_min": 50754.3,
+            "price_max": 50754.3,
+            "in_stock": True,
+            "category_names": ["HERRAMIENTAS A BATERIA"],
+        }
+
+    def test_ref_fp_id_inyecta_producto_exacto_en_el_prompt(self) -> None:
+        link = "https://www.ferreproindustrial.com/productos/taladro-ator-12v-20nm-1bat-usb-emtop-ecdl12456"
+
+        class _Corrida:
+            output = f"EMTOP · Taladro Ator 12V 20Nm\nPrecio: $50.754\n🔗 {link}"
+
+        agente = MagicMock()
+        agente.run_sync.return_value = _Corrida()
+        with (
+            patch.object(agent_mod, "decide_scope", return_value=ScopeDecision("in_scope")),
+            patch.object(agent_mod, "build_agent", return_value=agente),
+            patch.object(agent_mod, "sb_select", return_value=[self._producto()]) as select,
+        ):
+            reply = agent_mod.run_agent_reply("Hola, quiero info. Ref: FP-350860225", [])
+
+        prompt = agente.run_sync.call_args.args[0]
+        select.assert_called_once()
+        self.assertIn("id=eq.350860225", select.call_args.args[1])
+        self.assertIn("Producto referido por pauta/publicidad", prompt)
+        self.assertIn("Ref: FP-350860225", prompt)
+        self.assertIn("Precio vigente: $50.754", prompt)
+        self.assertEqual(reply.product_ids, [350860225])
+        self.assertEqual(reply.tool_calls[0]["tool"], "product_ref")
+        self.assertTrue(reply.tool_calls[0]["encontrado"])
+
+    def test_codigo_valido_no_cae_en_scope_ambiguo(self) -> None:
+        link = "https://www.ferreproindustrial.com/productos/taladro-ator-12v-20nm-1bat-usb-emtop-ecdl12456"
+
+        class _Corrida:
+            output = f"EMTOP · Taladro Ator 12V 20Nm\nPrecio: $50.754\n🔗 {link}"
+
+        agente = MagicMock()
+        agente.run_sync.return_value = _Corrida()
+        with (
+            patch.object(agent_mod, "decide_scope") as scope,
+            patch.object(agent_mod, "build_agent", return_value=agente),
+            patch.object(
+                agent_mod,
+                "sb_select",
+                return_value=[self._producto() | {"handle": "taladro-ator-12v-20nm-1bat-usb-emtop-ecdl12456-1otsu"}],
+            ),
+        ):
+            reply = agent_mod.run_agent_reply("Hola! Quiero info del producto del anuncio. Código: 1otsu", [])
+
+        scope.assert_not_called()
+        self.assertNotIn("confirmás qué producto", reply.text)
+        self.assertEqual(reply.tool_calls[0]["tipo"], "handle_suffix")
+
+    def test_codigo_en_historial_sirve_para_respuestas_cortas(self) -> None:
+        link = "https://www.ferreproindustrial.com/productos/taladro-ator-12v-20nm-1bat-usb-emtop-ecdl12456"
+
+        class _Corrida:
+            output = f"EMTOP · Taladro Ator 12V 20Nm\nPrecio: $50.754\n🔗 {link}"
+
+        agente = MagicMock()
+        agente.run_sync.return_value = _Corrida()
+        history = [AgentMessage(role="user", content="Hola! Quiero info. Código: 1otsu")]
+        with (
+            patch.object(agent_mod, "build_agent", return_value=agente),
+            patch.object(
+                agent_mod,
+                "sb_select",
+                return_value=[self._producto() | {"handle": "taladro-ator-12v-20nm-1bat-usb-emtop-ecdl12456-1otsu"}],
+            ),
+        ):
+            reply = agent_mod.run_agent_reply("precio?", history)
+
+        self.assertIn("Precio", reply.text)
+        self.assertEqual(reply.tool_calls[0]["tipo"], "handle_suffix")
+
+    def test_fuera_de_rubro_no_queda_tapado_por_codigo_en_historial(self) -> None:
+        history = [AgentMessage(role="user", content="Hola! Quiero info. Código: 1otsu")]
+        with (
+            patch.object(agent_mod, "build_agent") as build,
+            patch.object(
+                agent_mod,
+                "sb_select",
+                return_value=[self._producto() | {"handle": "taladro-ator-12v-20nm-1bat-usb-emtop-ecdl12456-1otsu"}],
+            ),
+        ):
+            reply = agent_mod.run_agent_reply("Motorola e14", history)
+
+        build.assert_not_called()
+        self.assertIn("no vendemos celulares", reply.text)
+        self.assertEqual(reply.tool_calls[-1]["tool"], "scope")
+
+    def test_link_de_producto_tambien_resuelve_contexto_de_pauta(self) -> None:
+        deps = Deps()
+        url = "https://www.ferreproindustrial.com/productos/taladro-ator-12v-20nm-1bat-usb-emtop-ecdl12456/"
+        with patch.object(agent_mod, "sb_select", return_value=[self._producto()]) as select:
+            context = agent_mod._product_ref_context(f"Hola, quiero info de {url}", [], deps)
+
+        self.assertIsNotNone(context)
+        self.assertIn("Ref: FP-350860225", context or "")
+        self.assertIn("canonical_url=eq.", select.call_args.args[1])
+        self.assertEqual(deps.product_ids_by_link[url.rstrip("/")], 350860225)
+
+    def test_codigo_corto_del_final_del_link_resuelve_producto(self) -> None:
+        producto = self._producto() | {"handle": "taladro-ator-12v-20nm-1bat-usb-emtop-ecdl12456-1otsu"}
+        deps = Deps()
+        with patch.object(agent_mod, "sb_select", return_value=[producto]) as select:
+            context = agent_mod._product_ref_context("Hola, quiero info. Código: 1otsu", [], deps)
+
+        self.assertIsNotNone(context)
+        self.assertIn("Ref: FP-350860225", context or "")
+        self.assertIn("handle=ilike.*-1otsu", select.call_args.args[1])
+        self.assertEqual(deps.tool_calls[0]["tipo"], "handle_suffix")
+        self.assertTrue(deps.tool_calls[0]["encontrado"])
+
+    def test_codigo_corto_ambiguo_no_se_toma_como_referencia_exacta(self) -> None:
+        deps = Deps()
+        with patch.object(
+            agent_mod,
+            "sb_select",
+            return_value=[
+                self._producto() | {"handle": "producto-a-1otsu"},
+                self._producto() | {"id": 99, "handle": "producto-b-1otsu"},
+            ],
+        ):
+            context = agent_mod._product_ref_context("Código: 1otsu", [], deps)
+
+        self.assertIsNone(context)
+        self.assertFalse(deps.tool_calls[0]["encontrado"])
 
 
 class PersistenciaTrace(unittest.TestCase):

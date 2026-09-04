@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import re
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -12,8 +13,8 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from .config import settings
 from .models import AgentMessage, Product
-from .search import buscar_productos as _buscar, compact_for_llm
-from .scope import decide_scope, scope_reply
+from .search import buscar_productos as _buscar, compact_for_llm, format_price
+from .scope import decide_scope, deterministic_scope, scope_reply
 from .supabase import select as sb_select
 
 PROMPT_FILE = Path(__file__).parent / "prompts" / "ferrepro.md"
@@ -32,6 +33,9 @@ FIXED_LINKS = {
 PRODUCT_URL_PREFIX = "https://www.ferreproindustrial.com/productos/"
 MAX_PRESENTED_PRODUCTS = 5
 MAX_EXPLICIT_PRODUCTS = 10
+PRODUCT_REF_RE = re.compile(r"\b(?:ref(?:erencia)?\.?\s*[:#-]?\s*)?FP[-\s]?(\d{5,})\b", re.IGNORECASE)
+PRODUCT_CODE_RE = re.compile(r"\b(?:c[oó]d(?:igo)?|ref(?:erencia)?)\.?\s*[:#-]?\s*([a-z0-9][a-z0-9-]{2,20})\b", re.IGNORECASE)
+PRODUCT_URL_RE = re.compile(r"https?://(?:www\.)?ferreproindustrial\.com/productos/[^\s<>)]+", re.IGNORECASE)
 
 
 class AgentError(RuntimeError):
@@ -164,17 +168,6 @@ def run_agent_reply(
 ) -> AgentReply:
     """`images`: lista de (bytes, media_type) para que el modelo multimodal las vea."""
     history = history or []
-    decision = decide_scope(message, history)
-    scoped_reply = scope_reply(decision)
-    if scoped_reply:
-        # Los pedidos fuera de rubro no llegan a las tools, pero son señal de demanda: se
-        # registran igual para que el BI vea qué le piden a Ferrepro que no vende.
-        return AgentReply(
-            scoped_reply,
-            [],
-            tool_calls=[{"tool": "scope", "status": decision.status, "producto": decision.product}],
-        )
-    agent = build_agent()
     history_links = _history_product_links(history)
     repeat_links = _asks_to_repeat(message)
     deps = Deps(
@@ -186,7 +179,34 @@ def run_agent_reply(
         shown_links=set(history_links),
         seen_links=set() if repeat_links else history_links,
     )
-    text = _build_input(message, history)
+    product_ref_context = _product_ref_context(message, history, deps)
+    fast_scope = deterministic_scope(message)
+    if fast_scope is not None and fast_scope.status == "out_of_scope":
+        scoped_reply = scope_reply(fast_scope)
+        return AgentReply(
+            scoped_reply or "",
+            [],
+            tool_calls=[
+                *deps.tool_calls,
+                {"tool": "scope", "status": fast_scope.status, "producto": fast_scope.product},
+            ],
+        )
+    if not product_ref_context:
+        decision = decide_scope(message, history, fast_scope=fast_scope)
+        scoped_reply = scope_reply(decision)
+        if scoped_reply:
+            # Los pedidos fuera de rubro no llegan a las tools, pero son señal de demanda: se
+            # registran igual para que el BI vea qué le piden a Ferrepro que no vende.
+            return AgentReply(
+                scoped_reply,
+                [],
+                tool_calls=[
+                    *deps.tool_calls,
+                    {"tool": "scope", "status": decision.status, "producto": decision.product},
+                ],
+            )
+    agent = build_agent()
+    text = _build_input(message, history, product_ref_context)
     prompt: object = text
     if images:
         prompt = [text, *[BinaryContent(data=data, media_type=mt) for data, mt in images]]
@@ -204,13 +224,16 @@ def run_agent_reply(
     return AgentReply(answer, product_ids, product_urls, deps.tool_calls)
 
 
-def _build_input(message: str, history: list[AgentMessage]) -> str:
-    if not history:
-        return message
-    lines = ["Historial reciente:"]
-    lines += [f"{m.role}: {m.content}" for m in history[-8:]]
+def _build_input(message: str, history: list[AgentMessage], product_ref_context: str | None = None) -> str:
+    lines: list[str] = []
+    if product_ref_context:
+        lines += ["Contexto interno del sistema:", product_ref_context, ""]
+    if history:
+        lines += ["Historial reciente:"]
+        lines += [f"{m.role}: {m.content}" for m in history[-8:]]
+        lines.append("")
     lines += ["", f"Mensaje actual del cliente: {message}"]
-    return "\n".join(lines)
+    return "\n".join(line for line in lines if line is not None).strip()
 
 
 _URL_RE = re.compile(r"https?://\S+")
@@ -258,6 +281,96 @@ def _filter_requested_product_type(products: list[Product], request: str) -> lis
 
 def _norm_url(url: str | None) -> str:
     return (url or "").rstrip(".,)").rstrip("/")
+
+
+def _product_ref_context(message: str, history: list[AgentMessage], deps: Deps) -> str | None:
+    for kind, value in _product_ref_candidates(message, history):
+        product = _product_by_reference(kind, value)
+        if not product:
+            deps.tool_calls.append({"tool": "product_ref", "tipo": kind, "valor": value, "encontrado": False})
+            continue
+        product_id = int(product["id"])
+        link = _norm_url(product.get("canonical_url"))
+        if link:
+            deps.shown_links.add(link)
+            deps.product_ids_by_link[link] = product_id
+        deps.tool_calls.append(
+            {"tool": "product_ref", "tipo": kind, "valor": value, "encontrado": True, "product_id": product_id}
+        )
+        return _format_product_ref_context(product)
+    return None
+
+
+def _product_ref_candidates(message: str, history: list[AgentMessage]) -> list[tuple[str, str]]:
+    texts = [message, *[m.content for m in reversed(history) if m.role == "user"]]
+    candidates: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for text in texts:
+        for match in PRODUCT_REF_RE.finditer(text):
+            candidate = ("id", match.group(1))
+            if candidate not in seen:
+                candidates.append(candidate)
+                seen.add(candidate)
+        for match in PRODUCT_CODE_RE.finditer(text):
+            raw_code = match.group(1).strip().strip(".,)")
+            code = raw_code.split("-")[-1] if "-" in raw_code else raw_code
+            candidate = ("handle_suffix", code.lower())
+            if candidate not in seen:
+                candidates.append(candidate)
+                seen.add(candidate)
+        for match in PRODUCT_URL_RE.finditer(text):
+            candidate = ("url", _norm_url(match.group(0)))
+            if candidate not in seen:
+                candidates.append(candidate)
+                seen.add(candidate)
+    return candidates
+
+
+def _product_by_reference(kind: str, value: str) -> dict[str, Any] | None:
+    select_fields = "id,name,brand,handle,canonical_url,price_min,price_max,in_stock,category_names"
+    if kind == "id":
+        rows = sb_select("ferrepro_productos", f"id=eq.{int(value)}&select={select_fields}&limit=1")
+        return rows[0] if rows else None
+    if kind == "url":
+        for url in (value, f"{value}/"):
+            encoded = urllib.parse.quote(url, safe="")
+            rows = sb_select("ferrepro_productos", f"canonical_url=eq.{encoded}&select={select_fields}&limit=1")
+            if rows:
+                return rows[0]
+    if kind == "handle_suffix":
+        encoded = urllib.parse.quote(value, safe="")
+        rows = sb_select("ferrepro_productos", f"handle=ilike.*-{encoded}&select={select_fields}&limit=2")
+        exact = [row for row in rows if str(row.get("handle") or "").lower().endswith(f"-{value.lower()}")]
+        return exact[0] if len(exact) == 1 else None
+    return None
+
+
+def _format_product_ref_context(product: dict[str, Any]) -> str:
+    price = format_price(
+        _float_or_none(product.get("price_min")),
+        _float_or_none(product.get("price_max")),
+    )
+    categories = ", ".join(str(c) for c in (product.get("category_names") or []) if c)
+    lines = [
+        "Producto referido por pauta/publicidad. Usalo como producto principal de la conversación.",
+        f"Ref: FP-{product['id']}",
+        f"Marca: {html.unescape(str(product.get('brand') or '')) or 'Sin marca'}",
+        f"Nombre: {html.unescape(str(product.get('name') or ''))}",
+        f"Precio vigente: {price or 'sin precio publicado'}",
+        f"Link: {_norm_url(product.get('canonical_url'))}",
+        f"Disponible: {'sí' if product.get('in_stock') else 'no'}",
+    ]
+    if categories:
+        lines.append(f"Categorías: {categories}")
+    lines.append(
+        'Si el cliente dice "este", "ese", "el de la foto", "precio", "quiero comprar" o similar, '
+        "asumí que habla de este producto. No preguntes qué producto es."
+    )
+    return "\n".join(lines)
+
+
+def _float_or_none(value: Any) -> float | None:
+    return None if value is None else float(value)
 
 
 def _history_product_links(history: list[AgentMessage]) -> set[str]:
