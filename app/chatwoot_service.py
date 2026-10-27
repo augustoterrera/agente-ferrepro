@@ -153,7 +153,7 @@ def process_pending_conversation_messages(conversation_id: int) -> tuple[int, bo
     history = chat_memory.recent_history(conversation_id, settings.chatwoot_history_limit, exclude_ids=set(message_ids))
 
     reset_requested = not images and user_content.strip().lower() == "/reset"
-    if reset_requested and _reset_authorized(conv, pending[-1].get("raw_payload") or {}):
+    if reset_requested and _reset_authorized(pending[-1].get("raw_payload") or {}):
         chat_memory.clear_conversation_history(conversation_id)
         outbox = chat_memory.create_outbox(
             conversation_id,
@@ -237,14 +237,11 @@ def registrar_link_de_agenda(conversation_id: int, answer: str, payload: dict[st
         logger.warning("agenda_link_state_failed", extra={"conversation_id": conversation_id, "error": str(exc)})
 
 
-def _reset_authorized(conv: chat_memory.Conversation, payload: dict[str, Any]) -> bool:
+def _reset_authorized(payload: dict[str, Any]) -> bool:
+    """El teléfono sale del contacto de WhatsApp, que el cliente no puede falsear: alcanza con
+    que esté en CHAT_RESET_PHONE. El reset solo borra el chat de quien lo escribe."""
     configured_phones = {"".join(ch for ch in phone if ch.isdigit()) for phone in settings.chat_reset_phone} - {""}
-    return bool(
-        configured_phones
-        and settings.chat_reset_conversation_id
-        and chatwoot_contact_phone(payload) in configured_phones
-        and conv.external_conversation_id in settings.chat_reset_conversation_id
-    )
+    return chatwoot_contact_phone(payload) in configured_phones
 
 
 def _collect_inputs(

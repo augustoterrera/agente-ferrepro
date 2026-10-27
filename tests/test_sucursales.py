@@ -52,12 +52,12 @@ class ConfigDesdeElEntorno(unittest.TestCase):
 
 
     def test_reset_con_uno_o_varios_valores(self) -> None:
-        """El .env viejo (un teléfono, un id) tiene que seguir arrancando igual."""
-        uno = self._settings(CHAT_RESET_PHONE="5493815551234", CHAT_RESET_CONVERSATION_ID="8")
-        self.assertEqual((uno.chat_reset_phone, uno.chat_reset_conversation_id), (["5493815551234"], ["8"]))
-        varios = self._settings(CHAT_RESET_PHONE="5493815551234, 5493816506312", CHAT_RESET_CONVERSATION_ID="8,15")
-        self.assertEqual(varios.chat_reset_phone, ["5493815551234", "5493816506312"])
-        self.assertEqual(varios.chat_reset_conversation_id, ["8", "15"])
+        """El .env viejo (un solo teléfono) tiene que seguir arrancando igual."""
+        self.assertEqual(self._settings(CHAT_RESET_PHONE="5493815551234").chat_reset_phone, ["5493815551234"])
+        self.assertEqual(
+            self._settings(CHAT_RESET_PHONE="5493815551234, 5493816506312").chat_reset_phone,
+            ["5493815551234", "5493816506312"],
+        )
         self.assertEqual(self._settings(CHAT_RESET_PHONE="").chat_reset_phone, [])
 
 
