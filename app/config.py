@@ -98,9 +98,11 @@ class Settings(BaseSettings):
     require_webhook_secret: bool = False
     chatwoot_history_limit: int = 16
     chatwoot_agent_limit: int = 5
-    # Comando administrativo /reset. Ambos valores deben coincidir con el webhook entrante.
-    chat_reset_phone: str | None = None
-    chat_reset_conversation_id: str | None = None
+    # Comando administrativo /reset. Ambos deben coincidir con el webhook entrante: el teléfono
+    # tiene que estar en CHAT_RESET_PHONE y la conversación en CHAT_RESET_CONVERSATION_ID.
+    # Formato en .env, uno o varios separados por coma: CHAT_RESET_PHONE=5493815551234,5493816506312
+    chat_reset_phone: Annotated[list[str], NoDecode] = []
+    chat_reset_conversation_id: Annotated[list[str], NoDecode] = []
     # Namespace de conversaciones en las tablas chat_*. DB propia de Ferrepro → "chatwoot"
     # no colisiona con nadie.
     channel: str = "chatwoot"
@@ -175,6 +177,15 @@ class Settings(BaseSettings):
         escribe una persona en el .env, no un serializador."""
         if isinstance(value, str):
             return [int(part) for part in value.replace(" ", "").split(",") if part]
+        return value
+
+    @field_validator("chat_reset_phone", "chat_reset_conversation_id", mode="before")
+    @classmethod
+    def _parse_reset(cls, value: Any) -> Any:
+        """"5493815551234, 5493816506312" → lista. Un solo valor (lo que había antes) sigue
+        sirviendo: queda una lista de uno."""
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
         return value
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")

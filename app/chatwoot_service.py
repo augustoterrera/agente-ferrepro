@@ -238,12 +238,12 @@ def registrar_link_de_agenda(conversation_id: int, answer: str, payload: dict[st
 
 
 def _reset_authorized(conv: chat_memory.Conversation, payload: dict[str, Any]) -> bool:
-    configured_phone = "".join(ch for ch in str(settings.chat_reset_phone or "") if ch.isdigit())
+    configured_phones = {"".join(ch for ch in phone if ch.isdigit()) for phone in settings.chat_reset_phone} - {""}
     return bool(
-        configured_phone
+        configured_phones
         and settings.chat_reset_conversation_id
-        and chatwoot_contact_phone(payload) == configured_phone
-        and conv.external_conversation_id == str(settings.chat_reset_conversation_id)
+        and chatwoot_contact_phone(payload) in configured_phones
+        and conv.external_conversation_id in settings.chat_reset_conversation_id
     )
 
 
