@@ -30,6 +30,42 @@ class Settings(BaseSettings):
     classifier_model: str = "gpt-4.1-mini"
     # Transcripción de audios (WhatsApp → texto). Modelo barato de speech-to-text.
     transcription_model: str = "gpt-4o-mini-transcribe"
+    # Página de citas de Google Calendar a la que el asesor solar manda a agendar la reunión. Se
+    # inyecta en el prompt ({{LINK_CALENDARIO}}) y es el único link que el guard deja pasar.
+    # Vacía (CALENDAR_BOOKING_URL=): el agente deriva a una persona para agendar en vez de mandar
+    # un link.
+    calendar_booking_url: str | None = "https://calendar.app.google/8dhSCmb5b81yTk9g7"
+
+    # ── Agenda: detectar reservas y confirmarlas por WhatsApp ───────────────────
+    # Cuenta de servicio de Google Cloud con la Calendar API habilitada. El calendario de las
+    # reservas se comparte con su email ("Ver todos los detalles de los eventos"). Acepta el JSON
+    # entero en una línea o la ruta al archivo. Sin esto + el calendar id, el sweep no corre.
+    google_service_account_json: str | None = None
+    # Id del calendario donde caen las reservas: el email de la cuenta dueña de la página de citas.
+    google_calendar_id: str | None = None
+    # Solo cuentan los eventos cuyo título contiene esto (ej. el nombre de la página de citas).
+    # Vacío: cualquier evento con invitados es candidato; igual solo se vincula si el teléfono
+    # coincide con un chat al que el bot le mandó el link.
+    agenda_titulo: str | None = None
+    agenda_sweep_minutes: Literal[1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30] = 2
+    # Hasta cuántos días hacia adelante se leen reservas.
+    agenda_horizonte_dias: int = 60
+    # Se buscan dueños de reservas entre los chats que recibieron el link en estos últimos días.
+    agenda_vinculo_dias: int = 14
+    # Etiqueta que se pone en Chatwoot al detectar la reserva. Además veta el retargeting.
+    agendado_label: str = "agendado"
+    # Plantillas aprobadas en Meta para cuando pasaron más de 24 h desde el último mensaje del
+    # cliente (ahí WhatsApp no deja mandar texto libre). Cuerpos sugeridos en .env.example.
+    # Confirmación de la reserva: sin plantilla, fuera de las 24 h queda una nota privada.
+    whatsapp_template_confirmacion: str | None = None
+    # Recordatorio para AGENDAR (no para asistir): solo a chats que vinieron de un anuncio, una
+    # vez, antes de que cierre la ventana gratis del anuncio. Sin plantilla, no se manda.
+    whatsapp_template_recordatorio_agenda: str | None = None
+    whatsapp_template_language: str = "es_AR"
+    # Ventana gratis de un chat que viene de un anuncio click-to-WhatsApp, contada desde el click.
+    # Meta hoy documenta "hasta 7 días" (antes eran 72 h): se usa 72 h para no pasarse nunca.
+    # Ojo: abarata, no habilita texto libre; pasadas las 24 h igual va plantilla.
+    agenda_ventana_anuncio_horas: float = 72
     # Etiqueta que, puesta por un humano en Chatwoot, silencia al bot (toma el control la persona).
     # Nombre como estado ("el bot está apagado"): al ponerla se apaga; mientras esté, sigue apagado.
     bot_apagado_label: str = "bot_apagado"

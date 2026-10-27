@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -388,11 +389,32 @@ def chatwoot_contact_phone(payload: dict[str, Any]) -> str | None:
     return phone or None
 
 
+# Frases con las que los prompts derivan de verdad: "vendedor" es la del agente de productos y
+# "asesor" la del asesor solar. Se reconocen las dos para que reactivar el agente de productos no
+# rompa el handoff.
+HANDOFF_PHRASES = ("te derivo con un vendedor", "te derivo con un asesor")
+# Cómo ofrece el bot pasar a una persona: "¿Querés que te derive / te pase / te comunique con un
+# vendedor?". El LLM no siempre usa la plantilla, así que se reconocen las variantes.
+_OFRECE_DERIVAR_RE = re.compile(
+    r"\bte\s+(?:derive|deriven|derivo|pase|pasen|paso|comunique|comuniquen|contacte|contacten)\b"
+    r"[^.?!\n]*\b(?:vendedor|asesor)"
+)
+
+
 def should_handoff_to_agent(content: str) -> bool:
+    """Solo deriva una afirmación ("Te derivo con un asesor..."). Una pregunta es una oferta y
+    deriva recién cuando el cliente dice que sí (is_handoff_acceptance): el bot escribía
+    "¿Querés que te derivo con un vendedor?" y la conversación se apagaba sin que el cliente
+    hubiera aceptado."""
     text = content.lower()
-    # ponytail: el prompt usa esta frase para derivaciones reales; si agregan nuevas plantillas,
+    # ponytail: el prompt usa estas frases para derivaciones reales; si agregan nuevas plantillas,
     # sumar frases acá antes de inventar estado/tool-calls.
-    return "te derivo con un vendedor" in text and "si quer" not in text
+    if "si quer" in text:
+        return False
+    return any(
+        any(phrase in oracion for phrase in HANDOFF_PHRASES) and not _es_pregunta(oracion)
+        for oracion in _oraciones(text)
+    )
 
 
 def is_handoff_acceptance(content: str, history: list[AgentMessage]) -> bool:
@@ -401,8 +423,16 @@ def is_handoff_acceptance(content: str, history: list[AgentMessage]) -> bool:
 
 
 def _offered_handoff(content: str) -> bool:
-    text = _plain(content)
-    return "vendedor" in text and ("queres que te derive" in text or "queres que te deriven" in text)
+    return bool(_OFRECE_DERIVAR_RE.search(_plain(content)))
+
+
+def _oraciones(text: str) -> list[str]:
+    return [oracion.strip() for oracion in re.split(r"(?<=[.!?\n])", text) if oracion.strip()]
+
+
+def _es_pregunta(oracion: str) -> bool:
+    # "¿" también cuenta: "Te derivo con un vendedor, ¿te parece?" pide permiso, no deriva.
+    return "?" in oracion or "¿" in oracion
 
 
 def _accepts_handoff(content: str) -> bool:

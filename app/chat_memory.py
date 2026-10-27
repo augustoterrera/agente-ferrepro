@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -391,6 +392,45 @@ def save_classification(
         "classified_at": _now(),
     }
     merge_state(conversation_id, {**patch, **(extra or {})})
+
+
+def last_user_message_at(conversation_id: int) -> datetime | None:
+    """Último mensaje del cliente: de ahí corre la ventana de 24 h de WhatsApp."""
+    rows = supabase.select(
+        "chat_messages",
+        f"conversation_id=eq.{conversation_id}&role=eq.user&order=created_at.desc&limit=1&select=created_at",
+    )
+    if not rows or not rows[0].get("created_at"):
+        return None
+    parsed = datetime.fromisoformat(str(rows[0]["created_at"]).replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+# ── Agenda ──────────────────────────────────────────────────────────────────
+def conversaciones_de_agenda(channel: str, *, link_desde: datetime, turno_desde: datetime) -> list[Conversation]:
+    """Dueños posibles de una reserva: los chats que recibieron el link de agenda hace poco, más
+    los que ya tienen un turno por delante (para el recordatorio, aunque el link sea viejo).
+
+    Los timestamps del state se guardan en ISO UTC, así que la comparación de texto que hace
+    PostgREST sobre `->>` ordena bien."""
+    campos = "select=id,channel,external_conversation_id,account_id,state&limit=1000"
+    por_id: dict[int, Conversation] = {}
+    for filtro, desde in (("state->agenda_link->>at", link_desde), ("state->agenda->>inicio", turno_desde)):
+        valor = urllib.parse.quote(desde.astimezone(timezone.utc).isoformat(), safe="")
+        for row in supabase.select("chat_conversations", f"channel=eq.{channel}&{filtro}=gte.{valor}&{campos}"):
+            conversacion = _conversation(row)
+            por_id[conversacion.id] = conversacion
+    return list(por_id.values())
+
+
+def primer_referral(conversation_id: int) -> dict | None:
+    """El click en el anuncio que abrió esta charla, si vino de uno (ver migración 003). Desde
+    ahí corre la ventana gratis de Meta para chats de anuncios."""
+    rows = supabase.select(
+        "chat_ad_referrals",
+        f"conversation_id=eq.{conversation_id}&order=created_at.asc&limit=1&select=created_at,source_id",
+    )
+    return rows[0] if rows else None
 
 
 def last_user_payload(conversation_id: int) -> dict:

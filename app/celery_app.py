@@ -30,6 +30,7 @@ celery_app.conf.update(
         "app.tasks.chatwoot_tasks.dispatch_pending_outbox_messages": {"queue": "chatwoot_outbound"},
         "app.tasks.chatwoot_tasks.cleanup_expired_locks": {"queue": "chatwoot_messages"},
         "app.tasks.chatwoot_tasks.sweep_retargeting": {"queue": "chatwoot_outbound"},
+        "app.tasks.chatwoot_tasks.sweep_agenda": {"queue": "chatwoot_outbound"},
     },
     beat_schedule={
         # Red de seguridad de la cola: si Redis pierde una task, el job persistido en la DB
@@ -57,6 +58,13 @@ celery_app.conf.update(
             "task": "app.tasks.chatwoot_tasks.sweep_retargeting",
             "schedule": crontab(minute=f"*/{settings.retargeting_sweep_minutes}", hour="8-21"),
         },
+        # Agenda: reservas de Google Calendar → confirmación por WhatsApp. Todo el día: quien
+        # reserva a la noche recibe la confirmación en el momento. Sin credenciales de Google
+        # sale al instante sin hacer nada.
+        "sweep-agenda": {
+            "task": "app.tasks.chatwoot_tasks.sweep_agenda",
+            "schedule": crontab(minute=f"*/{settings.agenda_sweep_minutes}"),
+        },
     },
 )
 
@@ -70,6 +78,9 @@ _ALERTAS_SILENCIADAS = {
     "app.tasks.chatwoot_tasks.dispatch_pending_outbox_messages",
     "app.tasks.chatwoot_tasks.requeue_stuck_conversation_jobs",
     "app.tasks.chatwoot_tasks.cleanup_expired_locks",
+    # Corre cada 2 minutos: con Google caído alertaría sin parar. Avisa ella misma, una vez por
+    # hora (_alertar_una_vez en chatwoot_tasks).
+    "app.tasks.chatwoot_tasks.sweep_agenda",
 }
 
 
