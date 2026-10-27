@@ -175,8 +175,8 @@ class RetargetingChecks(unittest.TestCase):
             }
         ]
         with (
-            patch.object(chatwoot_service.settings, "chat_reset_phone", "5493816506312"),
-            patch.object(chatwoot_service.settings, "chat_reset_conversation_id", "8"),
+            patch.object(chatwoot_service.settings, "chat_reset_phone", ["5493816506312"]),
+            patch.object(chatwoot_service.settings, "chat_reset_conversation_id", ["8"]),
             patch.object(chatwoot_service.chat_memory, "get_conversation", return_value=conversation),
             patch.object(chatwoot_service.chat_memory, "pending_messages", return_value=pending),
             patch.object(chatwoot_service.chat_memory, "recent_history", return_value=[]),
@@ -186,6 +186,7 @@ class RetargetingChecks(unittest.TestCase):
             patch.object(chatwoot_service.chat_memory, "update_jobs"),
             patch.object(chatwoot_service.chat_memory, "update_events"),
             patch.object(chatwoot_service, "sync_crm_contact"),
+            patch.object(chatwoot_service, "link_ad_referral"),
             patch.object(chatwoot_service, "run_agent_reply") as agent,
         ):
             result = chatwoot_service.process_pending_conversation_messages(5)
@@ -198,8 +199,8 @@ class RetargetingChecks(unittest.TestCase):
 
     def test_reset_requiere_telefono_y_conversacion_correctos(self) -> None:
         with (
-            patch.object(chatwoot_service.settings, "chat_reset_phone", "5493816506312"),
-            patch.object(chatwoot_service.settings, "chat_reset_conversation_id", "8"),
+            patch.object(chatwoot_service.settings, "chat_reset_phone", ["5493816506312"]),
+            patch.object(chatwoot_service.settings, "chat_reset_conversation_id", ["8"]),
         ):
             self.assertFalse(
                 chatwoot_service._reset_authorized(
@@ -211,6 +212,38 @@ class RetargetingChecks(unittest.TestCase):
                 chatwoot_service._reset_authorized(
                     Conversation(5, "chatwoot", "8", "6"),
                     {"sender": {"phone_number": "+54 9 381 000-0000"}},
+                )
+            )
+
+    def test_reset_acepta_varios_telefonos(self) -> None:
+        with (
+            patch.object(chatwoot_service.settings, "chat_reset_phone", ["5493815551234", "+54 9 381 650-6312"]),
+            patch.object(chatwoot_service.settings, "chat_reset_conversation_id", ["8", "15"]),
+        ):
+            for conversacion, telefono in (("8", "+5493815551234"), ("15", "+54 9 381 650-6312")):
+                self.assertTrue(
+                    chatwoot_service._reset_authorized(
+                        Conversation(5, "chatwoot", conversacion, "6"),
+                        {"sender": {"phone_number": telefono}},
+                    ),
+                    telefono,
+                )
+            self.assertFalse(
+                chatwoot_service._reset_authorized(
+                    Conversation(5, "chatwoot", "8", "6"),
+                    {"sender": {"phone_number": "+54 9 381 000-0000"}},
+                )
+            )
+
+    def test_reset_sin_configurar_no_autoriza(self) -> None:
+        with (
+            patch.object(chatwoot_service.settings, "chat_reset_phone", []),
+            patch.object(chatwoot_service.settings, "chat_reset_conversation_id", []),
+        ):
+            self.assertFalse(
+                chatwoot_service._reset_authorized(
+                    Conversation(5, "chatwoot", "8", "6"),
+                    {"sender": {"phone_number": "+5493815551234"}},
                 )
             )
 
