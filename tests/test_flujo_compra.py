@@ -103,7 +103,7 @@ class HuecosDetectadosPorMutacion(unittest.TestCase):
             patch.object(agent_mod, "build_agent", return_value=agente),
         ):
             # "si" no pide repetir el link: es justo el caso donde antes se borraba.
-            respuesta = agent_mod.run_agent_reply("si", historia)
+            respuesta = agent_mod._run_agent_reply_productos("si", historia)
         self.assertIn(link, respuesta.text)
 
 

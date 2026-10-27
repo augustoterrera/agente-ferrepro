@@ -3,13 +3,14 @@ from __future__ import annotations
 import logging
 import socket
 import time
+from collections import Counter
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterator
 
 import redis
 
-from app import chat_memory, notifier, retargeting
+from app import agenda, chat_memory, notifier, retargeting
 from app.celery_app import celery_app
 from app.chatwoot import (
     ChatwootError,
@@ -515,7 +516,10 @@ def classify_and_label_conversation(conversation_id: str) -> dict[str, object]:
         current = client.get_conversation_labels(account_id, conv.external_conversation_id)
         # Preservamos todo lo que no sea etapa: flags previas (sticky), bot_apagado y manuales.
         labels = [lbl for lbl in current if lbl not in STAGE_LABELS]
-        extra = (settings.reactivado_label,) if reactivado else ()
+        extra: tuple[str, ...] = (settings.reactivado_label,) if reactivado else ()
+        # Si el sweep de agenda la puso mientras esto leía las etiquetas, este set la pisaría.
+        if ((conv.state or {}).get("agenda") or {}).get("estado") == "agendado":
+            extra = (*extra, settings.agendado_label)
         for label in (result.stage, *result.flags, *extra):
             if label not in labels:
                 labels.append(label)
@@ -768,19 +772,325 @@ def _descartar(conversation_id: int, state_key: str, motivo: str) -> str:
 
 
 @contextmanager
-def _sweep_lock() -> Iterator[bool]:
+def _sweep_lock(key: str = SWEEP_LOCK_KEY) -> Iterator[bool]:
     """Evita que dos sweeps solapados paguen dos veces las llamadas al LLM (el envío ya es
     idempotente por el idempotency_key del outbox). Sin Redis se frena: el cap diario es una
     barrera de seguridad y no conviene degradarlo a múltiples sweeps concurrentes."""
     client = _redis()
     value = worker_id()
-    acquired = bool(client.set(SWEEP_LOCK_KEY, value, nx=True, ex=600))
+    acquired = bool(client.set(key, value, nx=True, ex=600))
     try:
         yield acquired
     finally:
         if acquired:
             try:
-                if client.get(SWEEP_LOCK_KEY) == value:
-                    client.delete(SWEEP_LOCK_KEY)
+                if client.get(key) == value:
+                    client.delete(key)
             except redis.RedisError:
-                logger.warning("retargeting_sweep_lock_release_failed")
+                logger.warning("sweep_lock_release_failed", extra={"key": key})
+
+
+# ── Agenda: reservas de Google Calendar ─────────────────────────────────────
+AGENDA_LOCK_KEY = "chatwoot:agenda:sweep"
+# Texto libre solo dentro de las 24 h del último mensaje del cliente; una hora de colchón por la
+# cola y los reintentos. Pasado esto, WhatsApp solo acepta plantillas.
+VENTANA_TEXTO_LIBRE = timedelta(hours=23)
+AGENDA_RETRY = dict(SWEEPER_RETRY, autoretry_for=(*RETRYABLE, redis.RedisError, agenda.AgendaError))
+
+
+@celery_app.task(name="app.tasks.chatwoot_tasks.sweep_agenda", queue="chatwoot_outbound", **AGENDA_RETRY)
+def sweep_agenda() -> dict[str, object]:
+    """Reservas del calendario → chat de WhatsApp (ver app/agenda.py):
+    1. Ata cada reserva al chat que recibió el link, por el teléfono del formulario.
+    2. Etiqueta `agendado`, deja una nota privada y le confirma el turno al cliente.
+    3. Recordatorio para AGENDAR a quien vino de un anuncio, recibió el link y no reservó.
+    No hay recordatorio para asistir a la reunión: es a propósito, lo pidió el negocio."""
+    if not agenda.habilitada():
+        return {"ok": True, "status": "deshabilitada"}
+    client = build_chatwoot_client(settings.chatwoot_url, settings.chatwoot_access_token)
+    if client is None:
+        return {"ok": False, "status": "chatwoot_no_configurado"}
+    with _sweep_lock(AGENDA_LOCK_KEY) as acquired:
+        if not acquired:
+            return {"ok": True, "status": "ya_corriendo"}
+        return _run_agenda_sweep(client, datetime.now(timezone.utc))
+
+
+def _run_agenda_sweep(client, now: datetime) -> dict[str, object]:
+    try:
+        reservas = agenda.proximas_reservas(now)
+    except agenda.AgendaError as exc:
+        # Corre cada 2 minutos: con credenciales rotas, una alerta por hora alcanza.
+        _alertar_una_vez("agenda:google_error", 3600, "agenda: no se pudo leer el calendario", {"error": str(exc)[:300]})
+        raise
+    conversaciones = chat_memory.conversaciones_de_agenda(
+        settings.channel,
+        link_desde=now - timedelta(days=settings.agenda_vinculo_dias),
+        turno_desde=now,
+    )
+    resumen: Counter[str] = Counter()
+    asignadas: set[int] = set()
+    # Vigentes primero, en orden de inicio: si un chat tiene dos reservas gana siempre la más
+    # próxima y no se pisan corrida a corrida. Las canceladas al final, con el estado ya al día.
+    for reserva in sorted(reservas, key=lambda r: r.cancelada):
+        try:
+            resumen[_procesar_reserva(client, reserva, conversaciones, asignadas, now)] += 1
+        except (*RETRYABLE, MetaError) as exc:
+            # Sin guardar estado: la próxima corrida lo reintenta.
+            logger.warning("agenda_reserva_failed", extra={"event_id": reserva.event_id, "error": str(exc)})
+            resumen["fallidas"] += 1
+    for conv in conversaciones:
+        try:
+            resultado = _recordatorio_para_agendar(client, conv, now)
+        except (*RETRYABLE, MetaError) as exc:
+            logger.warning("agenda_recordatorio_failed", extra={"conversation_id": conv.id, "error": str(exc)})
+            resultado = "fallido"
+        if resultado:
+            resumen[f"recordatorio_{resultado}"] += 1
+    logger.info("agenda_sweep", extra={"reservas": len(reservas), **resumen})
+    return {"ok": True, "reservas": len(reservas), **resumen}
+
+
+def _procesar_reserva(client, reserva: agenda.Reserva, conversaciones: list, asignadas: set[int], now: datetime) -> str:
+    conv = _duena_de_la_reserva(reserva, conversaciones)
+    if conv is None:
+        return "ignoradas" if reserva.cancelada else _reserva_sin_chat(reserva)
+    estado = dict((conv.state or {}).get("agenda") or {})
+
+    if reserva.cancelada:
+        if estado.get("estado") == "cancelado":
+            return "sin_cambios"
+        inicio = agenda.parse_dt(estado.get("inicio"))
+        estado.update(estado="cancelado", cancelado_at=now.isoformat())
+        _etiqueta_agendado(client, conv, presente=False)
+        turno = f" del {agenda.describir_turno(inicio)}" if inicio else ""
+        _nota(client, conv, f"❌ Canceló la reunión{turno}. Si quiere otro horario, mandale el link de agenda.")
+        _guardar_agenda(conv, estado)
+        return "canceladas"
+
+    if conv.id in asignadas:
+        return "duplicadas"
+    asignadas.add(conv.id)
+    inicio = reserva.inicio.isoformat()
+    if (estado.get("event_id"), estado.get("inicio"), estado.get("estado")) != (reserva.event_id, inicio, "agendado"):
+        reprogramada = estado.get("event_id") == reserva.event_id and estado.get("estado") == "agendado"
+        estado = {
+            "event_id": reserva.event_id,
+            "inicio": inicio,
+            "estado": "agendado",
+            "nombre": reserva.nombre,
+            "email": reserva.email,
+            "reprogramada": reprogramada,
+            "detectado_at": now.isoformat(),
+        }
+        _etiqueta_agendado(client, conv, presente=True)
+        quien = ", ".join(dato for dato in (reserva.nombre, reserva.email) if dato)
+        accion = "Cambió el turno al" if reprogramada else "Reservó la reunión para el"
+        _nota(client, conv, f"📅 {accion} {agenda.describir_turno(reserva.inicio)}" + (f" ({quien})." if quien else "."))
+        # Constancia antes de avisar: si el aviso falla, la próxima corrida reintenta solo el aviso
+        # (sin repetir etiqueta ni nota).
+        _guardar_agenda(conv, estado)
+    if "confirmacion" in estado:
+        return "sin_cambios"
+    estado["confirmacion"] = _confirmar_al_cliente(client, conv, reserva, bool(estado.get("reprogramada")), now)
+    _guardar_agenda(conv, estado)
+    return "confirmadas"
+
+
+def _duena_de_la_reserva(reserva: agenda.Reserva, conversaciones: list):
+    """El chat ya atado a la reserva; si no hay, el que recibió el link más recientemente con el
+    mismo teléfono que el cliente escribió en el formulario."""
+    for conv in conversaciones:
+        if ((conv.state or {}).get("agenda") or {}).get("event_id") == reserva.event_id:
+            return conv
+    if reserva.cancelada or not reserva.telefonos:
+        return None
+    candidatas = [
+        conv
+        for conv in conversaciones
+        if any(agenda.mismo_telefono(tel, str(_link_de_agenda(conv).get("telefono") or "")) for tel in reserva.telefonos)
+    ]
+    return max(candidatas, key=lambda conv: str(_link_de_agenda(conv).get("at") or ""), default=None)
+
+
+def _reserva_sin_chat(reserva: agenda.Reserva) -> str:
+    """Nadie más se va a enterar de esta reserva: se avisa una vez para confirmarla a mano.
+    Sin teléfono y sin AGENDA_TITULO puede ser un evento cualquiera con invitados: solo log."""
+    if not reserva.telefonos and not settings.agenda_titulo:
+        logger.info("agenda_evento_sin_telefono", extra={"event_id": reserva.event_id})
+        return "sin_telefono"
+    _alertar_una_vez(
+        f"agenda:sin_chat:{reserva.event_id}",
+        60 * 60 * 24 * 30,
+        "agenda: reserva sin chat de WhatsApp, confirmala a mano",
+        {
+            "turno": agenda.describir_turno(reserva.inicio) if reserva.inicio else "-",
+            "nombre": reserva.nombre or "-",
+            "email": reserva.email or "-",
+            "teléfono": ", ".join(reserva.telefonos) or "no lo dejó",
+        },
+    )
+    return "sin_telefono" if not reserva.telefonos else "sin_chat"
+
+
+def _confirmar_al_cliente(client, conv, reserva: agenda.Reserva, reprogramada: bool, now: datetime) -> str:
+    """Confirmación del turno: texto libre dentro de las 24 h; después, plantilla; sin plantilla,
+    nota para que lo haga una persona. Devuelve por dónde salió (queda en el estado)."""
+    if reserva.inicio <= now:
+        return "ya_empezo"
+    account_id = conv.account_id or settings.chatwoot_account_id
+    if settings.bot_apagado_label in client.get_conversation_labels(account_id, conv.external_conversation_id):
+        return "humano"  # la nota privada ya le avisó a la persona que lo atiende
+    if not reprogramada and _ya_confirmo_en_el_chat(conv.id):
+        return "ya_confirmado_en_chat"
+    texto = agenda.texto_confirmacion(reserva.inicio)
+    ultimo = chat_memory.last_user_message_at(conv.id)
+    if ultimo is not None and now - ultimo < VENTANA_TEXTO_LIBRE:
+        _encolar_texto(conv, texto, f"agenda:confirmacion:{reserva.event_id}:{reserva.inicio.isoformat()}")
+        return "texto_libre"
+    telefono = _link_de_agenda(conv).get("telefono")
+    if settings.whatsapp_template_confirmacion and telefono:
+        _enviar_plantilla(
+            client, conv, str(telefono), settings.whatsapp_template_confirmacion,
+            [agenda.describir_turno(reserva.inicio)], texto,
+        )
+        return "plantilla"
+    _nota(
+        client,
+        conv,
+        "⚠️ No se le confirmó el turno por WhatsApp: pasaron más de 24 h desde su último mensaje y "
+        "no hay plantilla de confirmación configurada. Confirmalo a mano.",
+    )
+    return "fuera_de_ventana"
+
+
+def _recordatorio_para_agendar(client, conv, now: datetime) -> str | None:
+    """Recordatorio para AGENDAR (nunca para asistir) a quien recibió el link y no reservó.
+
+    Dentro de las 24 h lo cubre el retargeting con texto libre. Esto es la segunda y última
+    chance, por plantilla, y solo para chats que vinieron de un anuncio: ahí Meta no cobra
+    durante su ventana (AGENDA_VENTANA_ANUNCIO_HORAS desde el click). Una sola vez, y lo más
+    tarde posible dentro de esa ventana, con el mismo criterio que el retargeting."""
+    plantilla = settings.whatsapp_template_recordatorio_agenda
+    state = conv.state or {}
+    telefono = _link_de_agenda(conv).get("telefono")
+    if not plantilla or not telefono or state.get("agenda"):
+        return None
+    recordatorio = state.get("recordatorio_agenda")
+    if recordatorio is None:
+        referral = chat_memory.primer_referral(conv.id)
+        click = _parse_ts(referral.get("created_at")) if referral else None
+        if click is None:
+            _marcar_recordatorio(conv, "no_aplica", "no vino de un anuncio")
+            return "no_aplica"
+        cierre = click + timedelta(hours=settings.agenda_ventana_anuncio_horas)
+        recordatorio = _marcar_recordatorio(conv, "pendiente", "esperando el momento", cierre=cierre.isoformat())
+    if recordatorio.get("decision") != "pendiente":
+        return None
+    cierre = _parse_ts(recordatorio.get("cierre"))
+    if cierre is None or now >= cierre:
+        _marcar_recordatorio(conv, "vencido", "se cerró la ventana del anuncio")
+        return "vencido"
+    if not retargeting.momento_de_enviar(cierre, now):
+        return None
+
+    ultimo = chat_memory.last_user_message_at(conv.id)
+    if ultimo is not None and now - ultimo < timedelta(hours=24):
+        _marcar_recordatorio(conv, "descartado", "la charla sigue activa: hay texto libre")
+        return "descartado"
+    account_id = conv.account_id or settings.chatwoot_account_id
+    motivo = retargeting.veto_por_etiquetas(client.get_conversation_labels(account_id, conv.external_conversation_id))
+    if motivo:
+        _marcar_recordatorio(conv, "descartado", motivo)
+        return "descartado"
+    ultimo_bot = next(
+        (m.content for m in reversed(chat_memory.recent_history(conv.id, 6)) if m.role == "assistant"), ""
+    )
+    if should_handoff_to_agent(ultimo_bot):
+        _marcar_recordatorio(conv, "descartado", "lo derivó a un asesor")
+        return "descartado"
+
+    _enviar_plantilla(client, conv, str(telefono), plantilla, [], agenda.texto_recordatorio_agenda())
+    _marcar_recordatorio(conv, "enviado", "vino de un anuncio, recibió el link y no reservó")
+    return "enviado"
+
+
+def _enviar_plantilla(client, conv, telefono: str, plantilla: str, parametros: list[str], texto: str) -> None:
+    """Va directo a Meta, como el catálogo: Chatwoot no la ve, así que se espeja en una nota
+    privada y en el historial del bot (para que entienda la respuesta del cliente). Lo que pasa
+    después del envío no puede fallar la corrida: se reintentaría y le llegaría dos veces."""
+    respuesta = send_whatsapp(agenda.plantilla_payload(telefono, plantilla, parametros))
+    try:
+        chat_memory.add_message(conv.id, "assistant", texto, raw_payload={"plantilla": plantilla, "meta": respuesta})
+        _nota(client, conv, f"{texto}\n\n---\nEnviado con la plantilla «{plantilla}» de WhatsApp.")
+    except (SupabaseError, ChatwootError) as exc:
+        logger.warning("agenda_plantilla_espejo_failed", extra={"conversation_id": conv.id, "error": str(exc)})
+
+
+def _encolar_texto(conv, texto: str, idempotency_key: str) -> None:
+    """Mismo camino que una respuesta del bot: historial + outbox + envío por Chatwoot."""
+    outbox = chat_memory.create_outbox(conv.id, conv.external_conversation_id, conv.channel, texto, idempotency_key)
+    if outbox is None:
+        raise SupabaseError("No se pudo crear el outbox de la agenda")
+    try:
+        chat_memory.add_message(conv.id, "assistant", texto, external_message_id=idempotency_key)
+    except SupabaseError as exc:
+        if "409" not in str(exc):  # ya estaba: reintento de una corrida anterior
+            raise
+    send_chatwoot_outbound_message.apply_async((str(outbox["id"]),), queue="chatwoot_outbound")
+
+
+def _ya_confirmo_en_el_chat(conversation_id: int) -> bool:
+    """El cliente avisó que agendó antes de que el sweep viera la reserva y el bot ya le mandó la
+    confirmación del PASO 4: no se repite."""
+    return any(
+        m.role == "assistant" and agenda.MARCA_CONFIRMACION in m.content.lower()
+        for m in chat_memory.recent_history(conversation_id, 6)
+    )
+
+
+def _etiqueta_agendado(client, conv, *, presente: bool) -> None:
+    account_id = conv.account_id or settings.chatwoot_account_id
+    actuales = client.get_conversation_labels(account_id, conv.external_conversation_id)
+    nuevas = [label for label in actuales if label != settings.agendado_label]
+    if presente:
+        nuevas.append(settings.agendado_label)
+    if set(nuevas) == set(actuales):
+        return
+    applied = client.set_conversation_labels(account_id, conv.external_conversation_id, nuevas)
+    sync_crm_labels(conv.external_conversation_id, applied or nuevas)
+
+
+def _nota(client, conv, texto: str) -> None:
+    account_id = conv.account_id or settings.chatwoot_account_id
+    client.create_outgoing_message(account_id, conv.external_conversation_id, texto, private=True)
+
+
+def _link_de_agenda(conv) -> dict:
+    link = (conv.state or {}).get("agenda_link")
+    return link if isinstance(link, dict) else {}
+
+
+def _guardar_agenda(conv, estado: dict) -> None:
+    # Una sola corrida a la vez (lock) es la única que escribe `agenda`: el merge shallow no pisa
+    # nada ajeno. Se refleja en memoria para lo que queda de la corrida.
+    chat_memory.merge_state(conv.id, {"agenda": estado})
+    conv.state = {**(conv.state or {}), "agenda": estado}
+
+
+def _marcar_recordatorio(conv, decision: str, motivo: str, **extra: str) -> dict:
+    previo = (conv.state or {}).get("recordatorio_agenda") or {}
+    marca = {**previo, **extra, "decision": decision, "motivo": motivo, "at": datetime.now(timezone.utc).isoformat()}
+    chat_memory.merge_state(conv.id, {"recordatorio_agenda": marca})
+    conv.state = {**(conv.state or {}), "recordatorio_agenda": marca}
+    return marca
+
+
+def _alertar_una_vez(clave: str, ttl_segundos: int, titulo: str, contexto: dict) -> None:
+    """Aviso por Telegram deduplicado en Redis: el sweep corre cada pocos minutos."""
+    try:
+        nueva = bool(_redis().set(clave, "1", nx=True, ex=ttl_segundos))
+    except redis.RedisError:
+        nueva = True
+    if nueva:
+        notifier.notify_warning(titulo, contexto=contexto)

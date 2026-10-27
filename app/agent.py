@@ -17,15 +17,51 @@ from .search import buscar_productos as _buscar, compact_for_llm, format_price
 from .scope import decide_scope, deterministic_scope, scope_reply
 from .supabase import select as sb_select
 
-PROMPT_FILE = Path(__file__).parent / "prompts" / "ferrepro.md"
+# ── Agente activo: asesor solar de FerrePro ─────────────────────────────────
+# El agente de productos de FerrePro NO se borró: quedó desactivado. Sus funciones y su prompt
+# (ferrepro.md) siguen intactos y las líneas que lo enchufaban están comentadas con "# [FERREPRO]"
+# (`grep -rn "\[FERREPRO\]" app`). Para volver a él: descomentá esas líneas y comentá la de abajo
+# de cada una. Acá: PROMPT_FILE, las tools en build_agent y el return de run_agent_reply.
+# [FERREPRO] PROMPT_FILE = Path(__file__).parent / "prompts" / "ferrepro.md"
+PROMPT_FILE = Path(__file__).parent / "prompts" / "ferrepro_solar.md"
+# Si el guard se come toda la respuesta (link inventado), el cliente no puede quedar sin contestar:
+# se deriva, igual que con cualquier cosa que el asesor no sabe resolver.
+DERIVACION_DE_RESPALDO = "Te derivo con un asesor de FerrePro para que lo vea con vos."
+CALENDAR_PLACEHOLDER = "{{LINK_CALENDARIO}}"
+# Sin link de agenda configurado no hay nada que mandar en el cierre: el paso se reemplaza por una
+# derivación, que es lo que el prompt manda hacer con todo lo que el bot no puede resolver.
+SIN_LINK_TEXTO = "(link de agenda no disponible)"
+SIN_LINK_AVISO = f"""
+
+---
+
+## AVISO DEL SISTEMA: NO HAY LINK DE AGENDA
+
+Todavía no hay link de agenda configurado. En el PASO 3 NO mandes ningún link ni el texto
+"{SIN_LINK_TEXTO}": cuando el cliente esté listo para la reunión, cerrá con
+"Perfecto, ya tengo una idea. El paso siguiente es una reunión de 20 min por videollamada.
+Te derivo con un asesor de FerrePro para agendarla."
+"""
 
 
 def load_system_prompt() -> str:
-    # Se relee por turno: editás ferrepro.md y el bot cambia sin reiniciar. El costo de
+    # Se relee por turno: editás el prompt y el bot cambia sin reiniciar. El costo de
     # leer un archivo chico por request es nulo (lo cachea el SO) y habilita iterar en vivo.
-    return PROMPT_FILE.read_text(encoding="utf-8")
+    prompt = PROMPT_FILE.read_text(encoding="utf-8")
+    if CALENDAR_PLACEHOLDER not in prompt:
+        return prompt
+    link = (settings.calendar_booking_url or "").strip()
+    if link:
+        return prompt.replace(CALENDAR_PLACEHOLDER, link)
+    return prompt.replace(CALENDAR_PLACEHOLDER, SIN_LINK_TEXTO) + SIN_LINK_AVISO
 
-# Links que el bot puede emitir aunque no vengan de una búsqueda.
+
+def solar_fixed_links() -> set[str]:
+    """Links que el asesor solar puede emitir: solo el de la agenda."""
+    link = (settings.calendar_booking_url or "").strip()
+    return {link} if link else set()
+
+# Links que el bot de FerrePro puede emitir aunque no vengan de una búsqueda.
 FIXED_LINKS = {
     "https://maps.app.goo.gl/ryspgRto3yHArQYp7",
     "https://www.ferreproindustrial.com/productos/",
@@ -75,6 +111,13 @@ def build_agent() -> Agent[Deps, str]:
     if effort and (settings.agent_model.startswith("gpt-5") or settings.agent_model.startswith("o")):
         model_settings = OpenAIChatModelSettings(openai_reasoning_effort=effort)
     agent = Agent(model=model, deps_type=Deps, system_prompt=load_system_prompt(), model_settings=model_settings)
+    # El asesor solar no tiene tools: todo su proceso vive en el prompt.
+    # [FERREPRO] _registrar_tools_de_productos(agent)
+    return agent
+
+
+def _registrar_tools_de_productos(agent: Agent[Deps, str]) -> None:
+    """[FERREPRO] Tools de catálogo del agente de productos (desactivado, ver PROMPT_FILE)."""
 
     @agent.tool
     def buscar_productos(
@@ -123,8 +166,6 @@ def build_agent() -> Agent[Deps, str]:
         )
         return detalle
 
-    return agent
-
 
 def _detalle(product_id: int, deps: Deps) -> dict[str, Any]:
     prods = sb_select("ferrepro_productos", f"id=eq.{product_id}&select=id,name,description,canonical_url")
@@ -165,8 +206,45 @@ def run_agent_reply(
     message: str,
     history: list[AgentMessage] | None = None,
     images: list[tuple[bytes, str]] | None = None,
+    contact_name: str | None = None,
+    turno: str | None = None,
 ) -> AgentReply:
-    """`images`: lista de (bytes, media_type) para que el modelo multimodal las vea."""
+    """Asesor solar de FerrePro. `images`: lista de (bytes, media_type) para que el modelo
+    multimodal las vea. `contact_name`: nombre de pila del perfil de WhatsApp, para el saludo.
+    `turno`: reunión ya reservada según el calendario ("jueves 29/10 a las 17 hs")."""
+    # [FERREPRO] return _run_agent_reply_productos(message, history, images)
+    history = history or []
+    # Sin compuerta de rubro ni referencias a productos: la compuerta de FerrePro frenaba como
+    # "fuera de rubro" respuestas normales del diagnóstico ("la heladera y el aire"). Lo que el
+    # asesor no sabe lo deriva el prompt.
+    deps = Deps(current_message=message)
+    agent = build_agent()
+    contexto = (
+        f"El cliente YA reservó la reunión para el {turno} (lo confirma el calendario). No le "
+        "vuelvas a mandar el link de agenda; si quiere cambiar o cancelar el turno, derivá."
+        if turno
+        else None
+    )
+    text = _build_input(message, history, contexto, contact_name=contact_name)
+    prompt: object = text
+    if images:
+        prompt = [text, *[BinaryContent(data=data, media_type=mt) for data, mt in images]]
+    try:
+        result = agent.run_sync(prompt, deps=deps)
+    except Exception as exc:
+        raise AgentError(f"Falló la corrida del agente: {exc}") from exc
+    # El único link legítimo es el de la agenda: cualquier otro es inventado.
+    answer = guard_links(result.output, solar_fixed_links()) or DERIVACION_DE_RESPALDO
+    return AgentReply(answer, [], tool_calls=deps.tool_calls)
+
+
+def _run_agent_reply_productos(
+    message: str,
+    history: list[AgentMessage] | None = None,
+    images: list[tuple[bytes, str]] | None = None,
+) -> AgentReply:
+    """[FERREPRO] Agente de productos (desactivado, ver PROMPT_FILE).
+    `images`: lista de (bytes, media_type) para que el modelo multimodal las vea."""
     history = history or []
     history_links = _history_product_links(history)
     repeat_links = _asks_to_repeat(message)
@@ -228,13 +306,23 @@ def run_agent_reply(
     return AgentReply(answer, product_ids, product_urls, deps.tool_calls)
 
 
-def _build_input(message: str, history: list[AgentMessage], product_ref_context: str | None = None) -> str:
+def _build_input(
+    message: str,
+    history: list[AgentMessage],
+    product_ref_context: str | None = None,
+    *,
+    contact_name: str | None = None,
+) -> str:
     lines: list[str] = []
     if product_ref_context:
         lines += ["Contexto interno del sistema:", product_ref_context, ""]
+    if contact_name:
+        lines += [f"Nombre del cliente (perfil de WhatsApp): {contact_name}", ""]
     if history:
         lines += ["Historial reciente:"]
-        lines += [f"{m.role}: {m.content}" for m in history[-8:]]
+        # 16 y no 8: el proceso solar dura ~10 mensajes y el cierre usa el segmento y las
+        # respuestas del principio. Con 8 se perdía para qué era la consulta.
+        lines += [f"{m.role}: {m.content}" for m in history[-16:]]
         lines.append("")
     lines += ["", f"Mensaje actual del cliente: {message}"]
     return "\n".join(line for line in lines if line is not None).strip()
@@ -477,17 +565,18 @@ if __name__ == "__main__":
     assert _answer_product_ids(f"🔗 {PRODUCT_URL_PREFIX}x/", {f"{PRODUCT_URL_PREFIX}x": 10}) == [10]
     assert _asks_to_repeat("pasame el link de nuevo")
     assert _asks_to_repeat("puedo comprarlo online")
-    assert "no vendemos celulares" in run_agent("Y los celulares cuánto está")
-    assert "no vendemos celulares" in run_agent("Motorola e14")
+    # [FERREPRO] La compuerta de rubro es determinística: corre sin red.
+    assert "no vendemos celulares" in _run_agent_reply_productos("Y los celulares cuánto está").text
+    assert "no vendemos celulares" in _run_agent_reply_productos("Motorola e14").text
     print("guard puro: OK")
 
-    if settings.openai_api_key and settings.supabase_url and settings.supabase_service_key:
-        print("\n--- 'hola, tenés taladros a batería?' ---")
-        print(run_agent("hola, tenés taladros a batería?"))
-        print("\n--- 'necesito precio por 10 taladros' (mayorista → derivar) ---")
-        out = run_agent("necesito precio por 10 taladros")
+    if settings.openai_api_key:
+        print("\n--- 'hola, quería info de los paneles solares' (segmentación) ---")
+        print(run_agent("hola, quería info de los paneles solares"))
+        print("\n--- 'qué garantía tienen los inversores?' (no sabe → derivar) ---")
+        out = run_agent("qué garantía tienen los inversores?")
         print(out)
-        assert "vendedor" in out.lower(), "esperaba derivación a vendedor"
+        assert "te derivo con un asesor" in out.lower(), "esperaba derivación a un asesor"
         print("\nself-check vivo: OK")
     else:
-        print("self-check vivo: SALTEADO (faltan OPENAI/SUPABASE)")
+        print("self-check vivo: SALTEADO (falta OPENAI_API_KEY)")

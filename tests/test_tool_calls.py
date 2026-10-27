@@ -26,8 +26,12 @@ class _Ctx:
 
 
 def _tool(nombre: str):
+    # Las tools de productos son del flujo FerrePro, hoy desactivado: build_agent ya no las
+    # registra solo. Se enchufan a mano para que el flujo guardado siga probado.
     with patch.object(agent_mod.settings, "openai_api_key", "sk-test"):
-        return build_agent()._function_toolset.tools[nombre].function
+        agente = build_agent()
+    agent_mod._registrar_tools_de_productos(agente)
+    return agente._function_toolset.tools[nombre].function
 
 
 def _producto(product_id: int, nombre: str) -> Product:
@@ -107,7 +111,7 @@ class ScopeTrace(unittest.TestCase):
             patch.object(agent_mod, "decide_scope", return_value=ScopeDecision("out_of_scope", "celulares")),
             patch.object(agent_mod, "build_agent") as build,
         ):
-            reply = agent_mod.run_agent_reply("tenés celulares?")
+            reply = agent_mod._run_agent_reply_productos("tenés celulares?")
 
         build.assert_not_called()
         self.assertEqual(
@@ -134,7 +138,7 @@ class ProductoReferidoPorPauta(unittest.TestCase):
             patch.object(agent_mod, "build_agent") as build,
             patch.object(agent_mod, "sb_select", return_value=[self._producto()]) as select,
         ):
-            reply = agent_mod.run_agent_reply("Hola, quiero info. Ref: FP-350860225", [])
+            reply = agent_mod._run_agent_reply_productos("Hola, quiero info. Ref: FP-350860225", [])
 
         scope.assert_not_called()
         build.assert_not_called()
@@ -156,7 +160,7 @@ class ProductoReferidoPorPauta(unittest.TestCase):
                 return_value=[self._producto() | {"handle": "taladro-ator-12v-20nm-1bat-usb-emtop-ecdl12456-1otsu"}],
             ),
         ):
-            reply = agent_mod.run_agent_reply("Hola! Quiero info del producto del anuncio. Código: 1otsu", [])
+            reply = agent_mod._run_agent_reply_productos("Hola! Quiero info del producto del anuncio. Código: 1otsu", [])
 
         scope.assert_not_called()
         build.assert_not_called()
@@ -177,7 +181,7 @@ class ProductoReferidoPorPauta(unittest.TestCase):
             patch.object(agent_mod, "build_agent") as build,
             patch.object(agent_mod, "sb_select", return_value=[taladro]),
         ):
-            reply = agent_mod.run_agent_reply("Hola! Quiero info sobre APILADOR HIDRAULICO 2TN X 2MTS. Código: 1tkdd", [])
+            reply = agent_mod._run_agent_reply_productos("Hola! Quiero info sobre APILADOR HIDRAULICO 2TN X 2MTS. Código: 1tkdd", [])
 
         build.assert_not_called()
         self.assertIn("Taladro Percutor", reply.text)
@@ -201,7 +205,7 @@ class ProductoReferidoPorPauta(unittest.TestCase):
                 return_value=[self._producto() | {"handle": "taladro-ator-12v-20nm-1bat-usb-emtop-ecdl12456-1otsu"}],
             ),
         ):
-            reply = agent_mod.run_agent_reply("precio?", history)
+            reply = agent_mod._run_agent_reply_productos("precio?", history)
 
         self.assertIn("Precio", reply.text)
         self.assertEqual(reply.tool_calls[0]["tipo"], "handle_suffix")
@@ -216,7 +220,7 @@ class ProductoReferidoPorPauta(unittest.TestCase):
                 return_value=[self._producto() | {"handle": "taladro-ator-12v-20nm-1bat-usb-emtop-ecdl12456-1otsu"}],
             ),
         ):
-            reply = agent_mod.run_agent_reply("Motorola e14", history)
+            reply = agent_mod._run_agent_reply_productos("Motorola e14", history)
 
         build.assert_not_called()
         self.assertIn("no vendemos celulares", reply.text)

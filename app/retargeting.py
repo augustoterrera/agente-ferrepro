@@ -11,7 +11,7 @@ from pydantic_ai import Agent, ModelRetry
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from .agent import _history_product_links, load_system_prompt
+from .agent import _URL_RE, _history_product_links, _norm_url, load_system_prompt, solar_fixed_links
 from .chatwoot import should_handoff_to_agent
 from .classifier import FLAG_LABELS
 from .config import settings
@@ -39,6 +39,8 @@ ETIQUETAS_QUE_VETAN: dict[str, str] = {
     "reclamo": "es un reclamo",
     "fuera_rubro": "pidió algo fuera del rubro",
     "mayorista": "es mayorista, lo sigue un vendedor",
+    # La pone el sweep de agenda al ver la reserva en el calendario: ya no hay nada que empujar.
+    settings.agendado_label: "ya agendó la reunión",
 }
 
 
@@ -59,13 +61,15 @@ PROMESAS_PROHIBIDAS = re.compile(
     # Compromiso en primera persona de conseguir un dato. El filtro de vocabulario solo no
     # alcanzaba: sacándole "origen", el modelo pasaba a "¿querés que te confirme de dónde son?",
     # que promete exactamente lo mismo.
-    r"|\bte\s+(?:lo\s+|la\s+|los\s+|las\s+)?(?:confirm|averigu|consig|pas|dig|busc)\w*",
+    # "te paso el link" no promete nada: en el asesor solar es el llamado a la acción.
+    r"|\bte\s+(?:lo\s+|la\s+|los\s+|las\s+)?(?:confirm|averigu|consig|pas(?!\w*\s+el\s+link)|dig|busc)\w*",
     re.IGNORECASE,
 )
 
 # La derivación a un vendedor sí es una salida válida (está en el prompt principal), así que un
 # mensaje que deriva no se marca aunque contenga alguna de esas formas.
-DERIVA_A_VENDEDOR = re.compile(r"\bvendedor\b", re.IGNORECASE)
+# "asesor" es la palabra del asesor solar; "vendedor", la del agente de productos.
+DERIVA_A_VENDEDOR = re.compile(r"\b(?:vendedor|asesor)\b", re.IGNORECASE)
 
 
 class RedactorError(RuntimeError):
@@ -83,11 +87,61 @@ class Followup(BaseModel):
 
 
 # Tarea del redactor. NO repite las reglas de negocio: se monta sobre el prompt principal
-# (ferrepro.md), que es la única fuente de qué puede y qué no puede prometer FerrePro. Duplicar
-# un subconjunto acá fue justamente lo que hizo que el primer dry-run ofreciera reservar un
-# producto y averiguar el origen de otro: dos cosas que el prompt principal prohíbe y que este
+# (load_system_prompt), que es la única fuente de qué se puede prometer y qué no. Duplicar un
+# subconjunto acá fue justamente lo que hizo que el primer dry-run de FerrePro ofreciera reservar
+# un producto y averiguar el origen de otro: dos cosas que el prompt principal prohíbe y que este
 # no sabía.
-REDACTOR_TAREA = """\
+REDACTOR_TAREA_SOLAR = """\
+---
+
+# TAREA ESPECIAL: MENSAJE DE RECONTACTO
+
+Todo lo de arriba sigue valiendo —quién sos, cómo es el proceso de FerrePro, qué podés prometer y
+qué no—, pero en esta tarea NO estás respondiendo un mensaje: estás decidiendo si vale la pena
+reabrir una conversación que quedó colgada, y escribiendo ese único mensaje.
+
+No tenés herramientas acá: trabajá EXCLUSIVAMENTE con lo que ya está escrito en la conversación
+que te paso. Si un dato no está ahí, no existe.
+
+## Primero decidí: ¿vale la pena? (vale_la_pena)
+
+Decí que NO si:
+- El cliente se despidió, agradeció y cerró, o dijo que no le interesa.
+- Ya agendó la reunión, o dijo que la agenda él más tarde.
+- Tu última respuesta derivó a un asesor: lo sigue una persona, no te metas.
+- Ya es cliente y escribió por un reclamo o un problema con una instalación.
+- Pidió algo que no es energía solar.
+- No hay nada concreto que retomar: un saludo suelto sin respuesta, o una charla que ya cerró.
+
+Ante la duda, NO escribas. Un mensaje de más molesta más de lo que un mensaje de menos pierde.
+
+Decí que SÍ solo si quedó algo concreto en el aire del proceso: la pregunta de para qué es (casa,
+empresa o campo) sin contestar, una pregunta del diagnóstico sin contestar, o el link de agenda
+mandado y la reunión sin agendar.
+
+## Si va, así tiene que ser el mensaje
+
+- 1 o 2 líneas, máximo 300 caracteres. Una sola pregunta, al final.
+- Retomá desde donde quedó, con las palabras que ya usó el cliente ("que no se te corte la
+  heladera"). El gancho es el respaldo, no el ahorro.
+- Si quedó el link de agenda sin usar: recordale la reunión de 20 min y volvé a poner el link de
+  agenda tal cual, solo en su propia línea. Es el único link que podés mandar.
+- Si quedó una pregunta del diagnóstico sin contestar: repetila en otras palabras, sin sumar otra.
+- Entrá directo y cordial. La charla ya venía saludada: no saludes de nuevo.
+- Nunca te disculpes por insistir, ni digas "te escribo de nuevo", ni menciones que pasó tiempo.
+- Como máximo un emoji.
+
+## Lo que este mensaje NO puede hacer
+
+NO cotices ni des rangos de precio, ahorro, potencia o cantidad de paneles. NO ofrezcas reservarle
+el turno vos ni propongas días u horarios: el cliente elige en el link. NO te comprometas a
+conseguir datos que no tenés ("te confirmo", "te averiguo"). Si el cliente había preguntado algo
+que no sabés y quedó sin responder, no se lo prometas: derivalo con "Te derivo con un asesor de
+FerrePro", o retomá por la reunión.
+"""
+
+# [FERREPRO] Tarea del redactor del agente de productos (desactivado).
+REDACTOR_TAREA_FERREPRO = """\
 ---
 
 # TAREA ESPECIAL: MENSAJE DE RECONTACTO
@@ -144,12 +198,15 @@ Si el cliente había preguntado algo de eso y quedó sin responder, no le promet
 ofrecé que lo vea un vendedor, o retomá por otro lado.
 """
 
+# [FERREPRO] REDACTOR_TAREA = REDACTOR_TAREA_FERREPRO
+REDACTOR_TAREA = REDACTOR_TAREA_SOLAR
+
 
 def build_redactor() -> Agent[None, Followup]:
     if not settings.openai_api_key:
         raise RuntimeError("Falta OPENAI_API_KEY para redactar el follow-up.")
     # El prompt principal se relee por corrida (igual que en el agente): si ajustás una regla de
-    # negocio en ferrepro.md, el redactor la toma sin tocar código.
+    # negocio en el prompt, el redactor la toma sin tocar código.
     system_prompt = load_system_prompt() + "\n\n" + REDACTOR_TAREA
     model = OpenAIChatModel(settings.retargeting_model, provider=OpenAIProvider(api_key=settings.openai_api_key))
     model_settings = None
@@ -166,21 +223,33 @@ def build_redactor() -> Agent[None, Followup]:
 
     @agent.output_validator
     def _sin_promesas_imposibles(salida: Followup) -> Followup:
-        """Si prometió algo que FerrePro no hace, se lo devolvemos para que reescriba (ModelRetry
-        re-pregunta con el motivo). Solo si agota los reintentos falla la corrida."""
-        if not (salida.vale_la_pena and salida.mensaje):
-            return salida
-        encontrado = PROMESAS_PROHIBIDAS.search(salida.mensaje)
-        if encontrado and not DERIVA_A_VENDEDOR.search(salida.mensaje):
-            raise ModelRetry(
-                f"El mensaje dice '{encontrado.group(0)}' y eso es algo que FerrePro no puede "
-                "cumplir por WhatsApp. Reescribilo sin ofrecer reservas, traslados entre "
-                "sucursales ni datos que no tenés (origen, procedencia, fichas técnicas). "
-                "Si el cliente preguntó eso, ofrecé que lo vea un vendedor o retomá por el producto."
-            )
-        return salida
+        return revisar_followup(salida)
 
     return agent
+
+
+def revisar_followup(salida: Followup) -> Followup:
+    """Si prometió algo que no se puede cumplir o inventó un link, se lo devolvemos para que
+    reescriba (ModelRetry re-pregunta con el motivo). Solo si agota los reintentos falla la corrida."""
+    if not (salida.vale_la_pena and salida.mensaje):
+        return salida
+    # Mismo criterio que guard_links() en el agente: el único link legítimo es el de agenda.
+    permitidos = {_norm_url(link) for link in solar_fixed_links()}
+    inventados = [url for url in _URL_RE.findall(salida.mensaje) if _norm_url(url) not in permitidos]
+    if inventados:
+        agenda = ", ".join(sorted(permitidos)) or "ninguno"
+        raise ModelRetry(
+            f"El mensaje trae un link que no existe ({inventados[0]}). El único link que podés "
+            f"mandar es el de agenda, tal cual: {agenda}. Si no hace falta, no pongas ninguno."
+        )
+    encontrado = PROMESAS_PROHIBIDAS.search(salida.mensaje)
+    if encontrado and not DERIVA_A_VENDEDOR.search(salida.mensaje):
+        raise ModelRetry(
+            f"El mensaje dice '{encontrado.group(0)}' y eso es algo que no se puede cumplir "
+            "por WhatsApp. Reescribilo sin ofrecer reservas ni datos que no tenés. Si el "
+            "cliente preguntó eso, derivá con la fórmula de siempre o retomá por donde quedó."
+        )
+    return salida
 
 
 def compose_followup(
@@ -298,13 +367,24 @@ def veto_por_conversacion(history: list[AgentMessage], stage: str | None) -> str
     # clasificar. Eso último no es teórico: las charlas anteriores al deploy tienen stage=None
     # porque el clasificador todavía no las espejó al estado, y ahí el redactor —que hereda el
     # prompt de ventas— tiende a querer engancharlas igual.
-    if stage in (None, "curioso") and not _mostro_productos(history):
-        return f"{stage or 'sin clasificar'} sin productos mostrados"
+    # En el asesor solar, el equivalente a "le mostré productos" es "le mandé el link de agenda".
+    if stage in (None, "curioso") and not (_mostro_productos(history) or _mando_link_de_agenda(history)):
+        return f"{stage or 'sin clasificar'} sin productos ni link de agenda"
     return None
 
 
 def _mostro_productos(history: list[AgentMessage]) -> bool:
     return bool(_history_product_links([m for m in history if m.role == "assistant"]))
+
+
+def _mando_link_de_agenda(history: list[AgentMessage]) -> bool:
+    links = {_norm_url(link) for link in solar_fixed_links()}
+    return any(
+        _norm_url(url) in links
+        for m in history
+        if m.role == "assistant"
+        for url in _URL_RE.findall(m.content)
+    )
 
 
 def state_labels(state: dict[str, Any] | None) -> list[str]:
@@ -390,31 +470,33 @@ if __name__ == "__main__":
         raise SystemExit
 
     # Vivo: casos donde debe escribir y casos donde no.
+    link = next(iter(solar_fixed_links()), "")
     casos: list[tuple[bool, str, list[AgentMessage]]] = [
         (
             True,
-            "quedó eligiendo entre opciones",
+            "recibió el link y no agendó",
             [
-                AgentMessage(role="user", content="hola, busco una amoladora de 4 1/2"),
-                AgentMessage(role="assistant", content="Tengo la Bosch GWS 850 a $89.000 y la Einhell TE-AG 125 a $62.000. ¿Cuál te interesa?"),
+                AgentMessage(role="user", content="es para mi casa, se corta mucho y no puedo quedarme sin heladera"),
+                AgentMessage(
+                    role="assistant",
+                    content=f"Perfecto, ya tengo una idea. Elegí el día y la hora que te quede mejor acá 👇\n{link}",
+                ),
             ],
         ),
         (
             False,
             "se despidió",
             [
-                AgentMessage(role="user", content="cuánto sale el taladro Bosch?"),
-                AgentMessage(role="assistant", content="El Bosch GSB 550 sale $75.000."),
                 AgentMessage(role="user", content="ah ok, gracias, después veo. saludos"),
-                AgentMessage(role="assistant", content="Dale, cualquier cosa avisame."),
+                AgentMessage(role="assistant", content="Dale, cualquier cosa escribime por acá. ¡Que andes bien!"),
             ],
         ),
         (
             False,
-            "saludo suelto sin producto",
+            "lo derivaron a un asesor",
             [
-                AgentMessage(role="user", content="hola"),
-                AgentMessage(role="assistant", content="¡Hola! ¿Qué producto estás buscando?"),
+                AgentMessage(role="user", content="qué garantía tienen los inversores?"),
+                AgentMessage(role="assistant", content="Te derivo con un asesor de FerrePro para que lo vea con vos."),
             ],
         ),
     ]

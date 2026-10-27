@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
-from . import chat_memory, media, supabase
+from . import agenda, chat_memory, media, supabase
 from .agent import AgentReply, run_agent_reply
 from .chatwoot import (
     ChatwootMessageEvent,
@@ -15,9 +16,11 @@ from .chatwoot import (
     message_attachments,
 )
 from .config import settings
+from .retargeting import contact_name
 
 logger = logging.getLogger(__name__)
-HANDOFF_ACCEPTED_REPLY = "Perfecto, te derivo con un vendedor de FerrePro para coordinarlo."
+# [FERREPRO] HANDOFF_ACCEPTED_REPLY = "Perfecto, te derivo con un vendedor de FerrePro para coordinarlo."
+HANDOFF_ACCEPTED_REPLY = "Perfecto, te derivo con un asesor de FerrePro para coordinarlo."
 RESET_REPLY = "Listo, borré la memoria de esta conversación. Tu próximo mensaje empieza desde cero."
 RESET_DENIED_REPLY = "Este comando no está habilitado para esta conversación."
 
@@ -174,7 +177,13 @@ def process_pending_conversation_messages(conversation_id: int) -> tuple[int, bo
         # Si el agente falla, propagamos: el estado retry/failed del job lo decide la task de
         # Celery según los reintentos. Los mensajes siguen en pending (nunca los marcamos
         # processing), así el retry los reprocesa.
-        reply = run_agent_reply(user_content, history, images=images or None)
+        reply = run_agent_reply(
+            user_content,
+            history,
+            images=images or None,
+            contact_name=contact_name(pending[-1].get("raw_payload") or {}),
+            turno=agenda.turno_vigente(conv.state),
+        )
     answer = reply.text
 
     # Si el cliente escribió MIENTRAS generábamos, esta respuesta quedó vieja: dejamos los
@@ -205,9 +214,27 @@ def process_pending_conversation_messages(conversation_id: int) -> tuple[int, bo
             "customer_phone": chatwoot_contact_phone(pending[-1].get("raw_payload") or {}),
         },
     )
+    registrar_link_de_agenda(conversation_id, answer, pending[-1].get("raw_payload") or {})
     chat_memory.update_jobs(conv.channel, conv.external_conversation_id, "completed")
     chat_memory.update_events(conv.channel, conv.external_conversation_id, "completed")
     return (int(outbox["id"]), True) if outbox else None
+
+
+def registrar_link_de_agenda(conversation_id: int, answer: str, payload: dict[str, Any]) -> None:
+    """Anota que este chat recibió el link de agenda y con qué teléfono: es lo que después permite
+    atar una reserva del calendario a la conversación (sweep_agenda). Fire-and-forget: perderlo
+    solo cuesta la confirmación automática, no la respuesta al cliente."""
+    link = (settings.calendar_booking_url or "").strip().rstrip("/")
+    phone = chatwoot_contact_phone(payload)
+    if not (link and phone and link in answer):
+        return
+    try:
+        chat_memory.merge_state(
+            conversation_id,
+            {"agenda_link": {"at": datetime.now(timezone.utc).isoformat(), "telefono": phone}},
+        )
+    except supabase.SupabaseError as exc:
+        logger.warning("agenda_link_state_failed", extra={"conversation_id": conversation_id, "error": str(exc)})
 
 
 def _reset_authorized(conv: chat_memory.Conversation, payload: dict[str, Any]) -> bool:
