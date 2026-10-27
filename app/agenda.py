@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,6 +34,9 @@ SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events"
 MAX_PAGINAS = 10
+# La página de citas titula la reserva "<título de la página> (<nombre del cliente>)" y no le
+# pone displayName al invitado: el nombre sale del título.
+_NOMBRE_EN_TITULO_RE = re.compile(r"\(([^()]+)\)\s*$")
 
 # Texto de la confirmación del PASO 4 del prompt. Si el bot ya la mandó en el chat (el cliente
 # avisó que agendó antes de que el sweep viera la reserva), no se repite.
@@ -100,7 +104,7 @@ def parse_evento(evento: dict[str, Any]) -> Reserva | None:
     if inicio is None:
         return None
     titulo = str(evento.get("summary") or "")
-    if settings.agenda_titulo and settings.agenda_titulo.lower() not in titulo.lower():
+    if settings.agenda_titulo and _sin_tildes(settings.agenda_titulo.strip()) not in _sin_tildes(titulo):
         return None
     invitados = [
         a
@@ -110,15 +114,23 @@ def parse_evento(evento: dict[str, Any]) -> Reserva | None:
     if not invitados:
         return None
     texto = "\n".join([str(evento.get("description") or ""), *[str(a.get("comment") or "") for a in invitados]])
+    nombre = str(invitados[0].get("displayName") or "").strip()
+    if not nombre and (match := _NOMBRE_EN_TITULO_RE.search(titulo)):
+        nombre = match.group(1).strip()
     return Reserva(
         event_id=event_id,
         cancelada=False,
         inicio=inicio,
-        nombre=str(invitados[0].get("displayName") or "").strip() or None,
+        nombre=nombre or None,
         email=str(invitados[0].get("email") or "").strip() or None,
         telefonos=tuple(extraer_telefonos(texto)),
         titulo=titulo,
     )
+
+
+def _sin_tildes(texto: str) -> str:
+    """Minúsculas y sin tildes: "Asesoria Ferrepro" en el .env matchea "Asesoría FerrePro"."""
+    return "".join(c for c in unicodedata.normalize("NFKD", texto.casefold()) if not unicodedata.combining(c))
 
 
 def _access_token() -> str:
@@ -333,7 +345,7 @@ if __name__ == "__main__":
     # crudo de cada evento, para ver dónde guarda Google las respuestas del formulario.
     raw = "--raw" in sys.argv
     reservas = proximas_reservas()
-    print(f"calendario {settings.google_calendar_id}: {len(reservas)} reserva(s)")
+    print(f"calendario {settings.google_calendar_id} · AGENDA_TITULO={settings.agenda_titulo!r}: {len(reservas)} reserva(s)")
     for r in reservas:
         turno = describir_turno(r.inicio) if r.inicio else "-"
         print(f"  {r.event_id} | {'CANCELADA' if r.cancelada else turno} | {r.nombre} | {r.email} | tel={r.telefonos}")
@@ -341,4 +353,9 @@ if __name__ == "__main__":
         token = _access_token()
         url = EVENTS_URL.format(calendar_id=urllib.parse.quote(settings.google_calendar_id or "", safe=""))
         query = urllib.parse.urlencode({"timeMin": datetime.now(timezone.utc).isoformat(), "singleEvents": "true", "maxResults": "5"})
-        print(json.dumps(_http("GET", f"{url}?{query}", token=token), ensure_ascii=False, indent=2))
+        data = _http("GET", f"{url}?{query}", token=token)
+        for evento in data.get("items") or []:
+            if parse_evento(evento) is None:
+                print(f"  descartado (todo el día, sin invitados o título distinto de AGENDA_TITULO): "
+                      f"{evento.get('id')} | {evento.get('summary')}")
+        print(json.dumps(data, ensure_ascii=False, indent=2))
