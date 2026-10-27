@@ -108,10 +108,32 @@ class EventosDelCalendario(unittest.TestCase):
         self.assertIsNone(agenda.parse_evento(self._evento(attendees=[{"email": "a@b", "self": True}])))
         self.assertIsNone(agenda.parse_evento(self._evento(start={"date": "2026-10-29"})))
 
+    def test_formato_real_de_la_pagina_de_citas(self) -> None:
+        """Así llega una reserva de la página de citas: el teléfono del formulario en la
+        descripción, el invitado sin displayName y el nombre entre paréntesis en el título."""
+        reserva = agenda.parse_evento({
+            "id": "ev2",
+            "status": "confirmed",
+            "summary": "Asesoría Ferrepro (Juan Pérez)",
+            "description": "<b>Reservada por</b>\nJuan Pérez\njuan@x.com\n+54 9 3815 55-1234",
+            "start": {"dateTime": "2026-10-28T09:00:00-03:00", "timeZone": "America/Argentina/Tucuman"},
+            "attendees": [
+                {"email": "agenda@ferrepro.com", "organizer": True, "self": True, "responseStatus": "accepted"},
+                {"email": "juan@x.com", "responseStatus": "accepted"},
+            ],
+            "eventType": "default",
+        })
+        self.assertEqual(reserva.nombre, "Juan Pérez")
+        self.assertEqual(reserva.email, "juan@x.com")
+        self.assertTrue(agenda.mismo_telefono(reserva.telefonos[0], TEL))
+
     def test_filtro_por_titulo(self) -> None:
         with patch.object(agenda.settings, "agenda_titulo", "Asesoría FerrePro"):
             self.assertIsNotNone(agenda.parse_evento(self._evento()))
             self.assertIsNone(agenda.parse_evento(self._evento(summary="Dentista")))
+        # La página se llama "Asesoría Ferrepro": el .env no tiene que copiar mayúsculas ni tildes.
+        with patch.object(agenda.settings, "agenda_titulo", "asesoria ferrepro"):
+            self.assertIsNotNone(agenda.parse_evento(self._evento(summary="Asesoría Ferrepro (Juan Pérez)")))
 
     def test_plantilla_sin_variables_no_manda_componentes(self) -> None:
         """Meta rechaza un componente body con la lista de parámetros vacía."""
