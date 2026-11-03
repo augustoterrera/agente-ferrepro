@@ -148,6 +148,9 @@ class Settings(BaseSettings):
     no_retargeting_label: str = "no_retargeting"
     # Etiqueta que se agrega cuando el cliente contesta el follow-up (visibilidad para el vendedor).
     reactivado_label: str = "reactivado"
+    # Nota privada con el resumen de la charla para el asesor (al mandar el link de agenda, al
+    # derivar y al reservar). Usa el modelo del retargeting.
+    resumen_asesor_enabled: bool = True
 
     # Token del endpoint /admin/*. Sin token, el endpoint responde 404 (no existe).
     admin_token: str | None = None
