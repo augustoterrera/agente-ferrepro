@@ -31,6 +31,7 @@ celery_app.conf.update(
         "app.tasks.chatwoot_tasks.cleanup_expired_locks": {"queue": "chatwoot_messages"},
         "app.tasks.chatwoot_tasks.sweep_retargeting": {"queue": "chatwoot_outbound"},
         "app.tasks.chatwoot_tasks.sweep_agenda": {"queue": "chatwoot_outbound"},
+        "app.tasks.chatwoot_tasks.resumir_para_asesor": {"queue": "chatwoot_outbound"},
     },
     beat_schedule={
         # Red de seguridad de la cola: si Redis pierde una task, el job persistido en la DB

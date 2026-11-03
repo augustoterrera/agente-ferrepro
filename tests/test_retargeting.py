@@ -21,6 +21,19 @@ from app.models import Product
 from app.tasks import chatwoot_tasks as tasks
 
 
+# El resumen para el asesor se encola en Redis después de cada envío que deriva o lleva el link:
+# en los tests no hay broker y cada intento de conexión tarda segundos.
+_sin_resumen = patch.object(tasks.resumir_para_asesor, "apply_async")
+
+
+def setUpModule() -> None:
+    _sin_resumen.start()
+
+
+def tearDownModule() -> None:
+    _sin_resumen.stop()
+
+
 class _Run:
     def __init__(self, output: retargeting.Followup):
         self.output = output

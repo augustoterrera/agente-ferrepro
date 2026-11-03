@@ -10,7 +10,7 @@ from typing import Iterator
 
 import redis
 
-from app import agenda, chat_memory, notifier, retargeting
+from app import agenda, chat_memory, notifier, resumen, retargeting
 from app.celery_app import celery_app
 from app.chatwoot import (
     ChatwootError,
@@ -243,6 +243,7 @@ def send_chatwoot_outbound_message(self, outbox_id: str, classify_conversation_i
             client, account_id = _chatwoot_client_for(conv)
             if client and account_id:
                 _handoff_if_needed(client, account_id, conv, outbox["content"])
+            _resumir_si_corresponde(outbox)
         _dispatch_classify(classify_conversation_id)
         return {"ok": outbox["status"] == "sent", "outbox_id": outbox_id, "status": f"already_{outbox['status']}"}
 
@@ -357,6 +358,8 @@ def send_chatwoot_outbound_message(self, outbox_id: str, classify_conversation_i
                 if status == "sent"
                 else False
             )
+            if status == "sent":
+                _resumir_si_corresponde(outbox)
             _dispatch_classify(classify_conversation_id)
             return {
                 "ok": status == "sent",
@@ -369,6 +372,7 @@ def send_chatwoot_outbound_message(self, outbox_id: str, classify_conversation_i
             raise
         raise self.retry(exc=exc)
     handoff = _handoff_if_needed(client, account_id, conv, outbox["content"])
+    _resumir_si_corresponde(outbox)
     _dispatch_classify(classify_conversation_id)
     return {"ok": True, "outbox_id": outbox_id, "status": "sent", "handoff": handoff}
 
@@ -890,6 +894,7 @@ def _procesar_reserva(client, reserva: agenda.Reserva, conversaciones: list, asi
         # Constancia antes de avisar: si el aviso falla, la próxima corrida reintenta solo el aviso
         # (sin repetir etiqueta ni nota).
         _guardar_agenda(conv, estado)
+        _dispatch_resumen(conv.id, "reserva", f"reserva:{reserva.event_id}:{inicio}")
     if "confirmacion" in estado:
         return "sin_cambios"
     estado["confirmacion"] = _confirmar_al_cliente(client, conv, reserva, bool(estado.get("reprogramada")), now)
@@ -1094,3 +1099,72 @@ def _alertar_una_vez(clave: str, ttl_segundos: int, titulo: str, contexto: dict)
         nueva = True
     if nueva:
         notifier.notify_warning(titulo, contexto=contexto)
+
+
+# ── Resumen para el asesor ──────────────────────────────────────────────────
+RESUMEN_RETRY = dict(autoretry_for=(*RETRYABLE, resumen.ResumenError), retry_backoff=True, max_retries=3)
+RESUMEN_TTL_SEGUNDOS = 30 * 24 * 3600
+
+
+@celery_app.task(name="app.tasks.chatwoot_tasks.resumir_para_asesor", queue="chatwoot_outbound", **RESUMEN_RETRY)
+def resumir_para_asesor(conversation_id: str, motivo: str, clave: str) -> dict[str, object]:
+    """Nota privada con el resumen de la charla para el asesor: cuando el bot manda el link de
+    agenda, cuando deriva y cuando el cliente reserva. `clave` identifica el disparo, así los
+    reintentos del envío o del sweep no la duplican."""
+    redis_key = f"chatwoot:resumen:{clave}"
+    if _redis().exists(redis_key):
+        return {"ok": True, "status": "ya_resumido"}
+    conv = chat_memory.get_conversation(int(conversation_id))
+    client, account_id = _chatwoot_client_for(conv)
+    if not client or not account_id:
+        return {"ok": False, "status": "chatwoot_not_configured"}
+    # Sin charla nueva desde el último resumen no hay nada que agregar: pasa al reservar justo
+    # después del link, o cuando el bot vuelve a mandar el link.
+    previo = _parse_ts(((conv.state or {}).get("resumen_asesor") or {}).get("at"))
+    ultimo = chat_memory.last_user_message_at(conv.id)
+    if previo is not None and (ultimo is None or ultimo <= previo):
+        return {"ok": True, "status": "sin_novedades"}
+    history = chat_memory.recent_history(conv.id, resumen.HISTORIAL)
+    if not history:
+        return {"ok": True, "status": "sin_historial"}
+    salida = resumen.resumir(
+        history,
+        nombre=retargeting.contact_name(chat_memory.last_user_payload(conv.id)),
+        flags=retargeting.state_flags(conv.state),
+    )
+    texto = resumen.nota(salida, motivo=motivo, turno=agenda.turno_vigente(conv.state))
+    if not _redis().set(redis_key, "1", nx=True, ex=RESUMEN_TTL_SEGUNDOS):
+        return {"ok": True, "status": "ya_resumido"}
+    try:
+        _nota(client, conv, texto)
+    except ChatwootError:
+        _redis().delete(redis_key)
+        raise
+    chat_memory.merge_state(
+        conv.id, {"resumen_asesor": {"at": datetime.now(timezone.utc).isoformat(), "motivo": motivo}}
+    )
+    return {"ok": True, "status": "enviado", "motivo": motivo}
+
+
+def _resumir_si_corresponde(outbox: dict) -> None:
+    """Después de enviar: si el mensaje derivó o llevaba el link de agenda, resumen para el asesor."""
+    content = str(outbox.get("content") or "")
+    link = (settings.calendar_booking_url or "").strip().rstrip("/")
+    if should_handoff_to_agent(content):
+        motivo = "derivacion"
+    elif link and link in content:
+        motivo = "link"
+    else:
+        return
+    _dispatch_resumen(outbox["conversation_id"], motivo, f"outbox:{outbox['id']}")
+
+
+def _dispatch_resumen(conversation_id: int | str, motivo: str, clave: str) -> None:
+    """Fire-and-forget: sin resumen el asesor igual tiene el chat, así que encolarlo nunca puede
+    tumbar el envío ni el sweep."""
+    if not settings.resumen_asesor_enabled:
+        return
+    try:
+        resumir_para_asesor.apply_async((str(conversation_id), motivo, clave), queue="chatwoot_outbound")
+    except Exception as exc:
+        logger.warning("resumen_dispatch_failed", extra={"conversation_id": conversation_id, "error": str(exc)})

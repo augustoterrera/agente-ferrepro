@@ -179,12 +179,46 @@ class TurnoDelAsesor(unittest.TestCase):
         self.assertIn("Nombre del cliente (perfil de WhatsApp): Juan", entrada)
 
     def test_el_historial_alcanza_para_todo_el_proceso(self) -> None:
-        """El cierre usa el segmento del primer mensaje: con 8 mensajes de historial se perdía."""
+        """El cierre usa el segmento del primer mensaje: con 8 mensajes de historial se perdía.
+        Saludo, segmento, factura, tres preguntas y el cierre: unos 13 mensajes."""
         history = [AgentMessage(role="user", content="es para el campo")] + [
-            AgentMessage(role="assistant" if i % 2 else "user", content=f"m{i}") for i in range(11)
+            AgentMessage(role="assistant" if i % 2 else "user", content=f"m{i}") for i in range(13)
         ]
         _, agente, _ = _correr("no hay red", history=history)
         self.assertIn("es para el campo", agente.run_sync.call_args.args[0])
+
+
+class PedidoDeFactura(unittest.TestCase):
+    """Después de la segmentación y antes del diagnóstico, el bot pide la foto de la factura."""
+
+    CASA_EMPRESA = "Perfecto. ¿Me pasás una foto de tu última factura de luz? Con eso podemos analizar tu situación."
+    CAMPO = (
+        "Perfecto. Si ese lugar tiene luz de red, ¿me pasás una foto de la última factura? "
+        "Si no hay red o no la tenés a mano, no hay problema."
+    )
+
+    def test_los_mensajes_van_tal_cual(self) -> None:
+        bloques = [b.strip() for b in PLANTILLAS]
+        self.assertIn(self.CASA_EMPRESA, bloques)
+        self.assertIn(self.CAMPO, bloques)
+
+    def test_va_entre_la_segmentacion_y_el_diagnostico(self) -> None:
+        self.assertLess(PROMPT.index("## PASO 1 ·"), PROMPT.index("## PASO 1B · FOTO DE LA FACTURA"))
+        self.assertLess(PROMPT.index("## PASO 1B · FOTO DE LA FACTURA"), PROMPT.index("## PASO 2 ·"))
+
+    def test_una_sola_pregunta_y_no_deriva(self) -> None:
+        for mensaje in (self.CASA_EMPRESA, self.CAMPO):
+            self.assertEqual(mensaje.count("?"), 1, mensaje)
+            self.assertFalse(should_handoff_to_agent(mensaje))
+            self.assertNotIn("ahorr", mensaje.lower())
+
+    def test_sin_factura_sigue_sin_insistir(self) -> None:
+        paso = PROMPT[PROMPT.index("## PASO 1B"):PROMPT.index("## PASO 2 ·")]
+        self.assertIn('"Dale, sin problema."', paso)
+        self.assertIn("No se la vuelvas a pedir.", paso)
+
+    def test_empresa_no_pregunta_lo_que_ya_dice_la_factura(self) -> None:
+        self.assertIn("Salteala si ya mandó la factura", PROMPT)
 
 
 class EtiquetasDelSegmento(unittest.TestCase):

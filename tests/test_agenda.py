@@ -164,6 +164,7 @@ class _Sweep(unittest.TestCase):
             patch.object(tasks.chat_memory, "create_outbox", return_value={"id": 99, "status": "pending"}) as self.outbox,
             patch.object(tasks.chat_memory, "add_message") as self.historial,
             patch.object(tasks, "send_chatwoot_outbound_message") as self.envio,
+            patch.object(tasks, "_dispatch_resumen") as self.resumen,
             patch.object(tasks, "send_whatsapp", return_value={"messages": [{"id": "wamid"}]}) as self.meta,
             patch.object(tasks, "sync_crm_labels"),
             patch.object(tasks, "notifier") as self.notifier,
@@ -187,6 +188,12 @@ class ConfirmacionDelTurno(_Sweep):
         self.assertIn("Reservó la reunión para el jueves 29/10 a las 12 hs", self.chatwoot.notas[0])
         estado = self.estados[5]["agenda"]
         self.assertEqual((estado["event_id"], estado["estado"], estado["confirmacion"]), ("ev1", "agendado", "texto_libre"))
+        self.resumen.assert_called_once_with(5, "reserva", f"reserva:ev1:{TURNO.isoformat()}")
+
+    def test_reserva_ya_vista_no_vuelve_a_resumir(self) -> None:
+        ya_vista = {"agenda": {"event_id": "ev1", "inicio": TURNO.isoformat(), "estado": "agendado", "confirmacion": "texto_libre"}}
+        self.assertEqual(self.correr([_reserva()], [_conv(ya_vista)])["sin_cambios"], 1)
+        self.resumen.assert_not_called()
 
     def test_pasadas_24h_va_por_plantilla(self) -> None:
         """Texto libre fuera de la ventana: Meta lo rechaza (131047) y el cliente no se entera."""
