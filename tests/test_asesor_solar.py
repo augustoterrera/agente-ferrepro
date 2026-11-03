@@ -62,7 +62,7 @@ class PlantillasDelProceso(unittest.TestCase):
             "¿Te queda mejor a la mañana o a la tarde?",
             "Diseñamos tu sistema en software",
             "quedó tu turno",
-            "El número sale de la simulación",
+            "El precio depende de tu consumo",
         ):
             bloques = _plantillas(fragmento)
             self.assertTrue(bloques, fragmento)
@@ -216,6 +216,14 @@ class PedidoDeFactura(unittest.TestCase):
         paso = PROMPT[PROMPT.index("## PASO 1B"):PROMPT.index("## PASO 2 ·")]
         self.assertIn('"Dale, sin problema."', paso)
         self.assertIn("No se la vuelvas a pedir.", paso)
+
+    def test_nunca_habla_de_simulacion(self) -> None:
+        """Lo que ve el cliente no menciona simular: ni al recibir la factura ni en el cierre."""
+        for b in PLANTILLAS:
+            self.assertNotIn("simul", b.lower(), b[:60])
+
+    def test_al_recibir_la_foto_solo_agradece(self) -> None:
+        self.assertIn("¡Gracias! ¿Qué te hizo buscar esto ahora, los cortes o la factura?", [b.strip() for b in PLANTILLAS])
 
     def test_empresa_no_pregunta_lo_que_ya_dice_la_factura(self) -> None:
         self.assertIn("Salteala si ya mandó la factura", PROMPT)
